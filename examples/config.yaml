@@ -1,0 +1,67 @@
+%YAML:1.0
+video_source: "data/main.h264" # data/main.h264 data/orgin.h264 rtsp://192.168.10.120:554/stream1 rtsp://127.0.0.1:8554/test data/long_low.m4v
+
+mode:
+  width: 640                   # Display width
+  height: 360                  # Display height
+  optimize_fps: 1              # Optimize frame rate (1 = enabled, 0 = disabled)
+  use_cuda: 1                  # Use CUDA acceleration (1 = enabled, 0 = disabled)
+  enhancer_enabled: 1          # Enable enhancer module (1 = enabled, 0 = disabled)
+  roll_correction_enabled: 1   # Enable roll correction (1 = enabled, 0 = disabled)
+  stabilizer_enabled: 1        # Enable stabilizer module (1 = enabled, 0 = disabled)
+
+camera:
+  threaded_queue_mode: true    # Enable threaded queue for capturing frames
+  colorspace: ""               # Colorspace (e.g., "GRAY", "BGR")
+  logging: true                # Enable camera logging
+  time_delay: 0                # Time delay before processing (ms)
+  thread_timeout: 5000         # Timeout for video frame retrieval (ms)
+
+enhancer:
+  # --- Basic parameters ---
+  brightness: 1.5              # Brightness offset (adds to pixel intensity)
+  contrast: 1.1                # Contrast multiplier (1.0 = no change)
+  
+  # --- Advanced pipeline toggles ---
+  enable_white_balance: 0      # Auto white balance
+  wb_strength: 1.0             # Strength of white balance correction [0..1]
+
+  enable_vibrance: 1           # Boost color saturation adaptively
+  vibrance_strength: 0.02      # Vibrance amount [0..1]
+
+  enable_unsharp: 1            # Enable unsharp mask for sharpening
+  sharpness: 2.0               # Amount of sharpening
+  blur_sigma: 1.0              # Blur sigma used for unsharp mask
+
+  enable_denoise: 0            # FastNlMeans Denoising
+  denoise_strength: 10         # Denoising intensity (higher = stronger)
+
+  gamma: 1.2                   # Gamma correction factor (1.0 = no change)
+  
+  enable_clahe: 0
+  clahe_clip_limit: 2.0
+  clahe_tile_grid_size: 8
+  
+  use_cuda: true               # Use CUDA path for enhancement
+
+roll_correction:
+  scale_factor: 0.25           # Downscaling factor for processing
+  canny_threshold_low: 50      # Lower Canny edge detection threshold
+  canny_threshold_high: 150    # Upper Canny edge detection threshold
+  canny_aperture: 3            # Aperture size for Sobel (must be odd)
+  hough_rho: 1.0               # Distance resolution for HoughLines (pixels)
+  hough_theta: 0.0174533       # Angular resolution for HoughLines (radians)
+  hough_threshold: 100         # Minimum votes for detected lines
+  angle_smoothing_alpha: 0.1   # Smoothing factor for angle stability
+  angle_decay: 0.98            # Rate at which the angle drifts back to zero
+  angle_filter_min: -70.0      # Minimum valid angle for detected lines
+  angle_filter_max: 70.0       # Maximum valid angle for detected lines
+
+stabilizer:
+  smoothing_radius: 20         # Number of frames for smoothing
+  border_type: "replicate"     # Border handling ("black", "replicate", etc.)
+  border_size: 0               # Border size for stabilization
+  crop_n_zoom: 0               # Crop & zoom enabled (1 = enabled, 0 = disabled)
+  logging: true                # Enable stabilizer logging
+  use_cuda: true               # Use CUDA acceleration for stabilization
+

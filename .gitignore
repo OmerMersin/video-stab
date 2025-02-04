@@ -1,0 +1,7 @@
+*.o
+*.exe
+/build/
+.vscode/
+/spare/
+/examples/data/
+
