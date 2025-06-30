@@ -1,0 +1,2 @@
+/usr/bin/ar qc libstabilizer_cuda.a CMakeFiles/stabilizer_cuda.dir/src/stabilizer_cuda.cu.o
+/usr/bin/ranlib libstabilizer_cuda.a

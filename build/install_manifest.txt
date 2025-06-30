@@ -1,0 +1,12 @@
+/usr/local/lib/libvideo-stab.a
+/usr/local/include/video/DeepStreamTracker.h
+/usr/local/include/video/RTSPServer.h
+/usr/local/include/video/Stabilizer.h
+/usr/local/include/video/Mode.h
+/usr/local/include/video/RollCorrection.h
+/usr/local/include/video/AutoZoomCrop.h
+/usr/local/include/video/stabilizer_cuda.h
+/usr/local/include/video/TcpReciever.h
+/usr/local/include/video/CamCap.h
+/usr/local/include/video/Enhancer.h
+/usr/local/lib/cmake/video-stab/video-stabConfigVersion.cmake

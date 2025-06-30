@@ -1,0 +1,119 @@
+%YAML:1.0
+video_source: "rtsp://192.168.144.119:554" 
+
+mode:
+  width:  1920
+  height:  1080
+  optimize_fps:  1
+  use_cuda:  1
+  tracker_enabled: 0
+  enhancer_enabled: 0
+  roll_correction_enabled: 0
+  stabilizer_enabled: 0
+
+
+camera:
+  threaded_queue_mode:  true
+  colorspace: ""               
+  logging:  false
+  time_delay:  0
+  thread_timeout:  500
+  queue_size: 5
+
+enhancer:
+  brightness:  1.5
+  contrast:  1.1
+  
+
+  enable_white_balance:  0
+  wb_strength:  0.1
+
+  enable_vibrance:  0
+  vibrance_strength:  0.02
+
+  enable_unsharp:  1
+  sharpness:  2.0
+  blur_sigma: 1.0              
+
+  enable_denoise:  0
+  denoise_strength:  10
+
+  gamma:  1.2
+  
+  enable_clahe:  0
+  clahe_clip_limit:  2.0
+  clahe_tile_grid_size:  8
+  
+  use_cuda: true               
+
+roll_correction:
+  scale_factor:  0.25
+  canny_threshold_low:  50
+  canny_threshold_high:  150
+  canny_aperture:  3
+  hough_rho:  1.0
+  hough_theta: 0.0174533      
+  hough_threshold:  100
+  angle_smoothing_alpha:  0.1
+  angle_decay:  0.98
+  angle_filter_min:  -70.0
+  angle_filter_max:  70.0
+
+stabilizer:
+  # Basic parameters
+  smoothing_radius: 0
+  border_type: "replicate"
+  fadeDuration: 30      # Number of frames over which to apply the fade effect
+  fadeAlpha: 0.9        # Rate of decay for the fade effect (0-1)
+  border_size: 10
+  crop_n_zoom: 0
+  logging: true
+  use_cuda: true
+  max_corners: 300
+  quality_level: 0.05
+  min_distance: 25.0
+  block_size: 3
+  
+  # SightLine-inspired parameters
+  smoothing_method: "gaussian"  # Options: "box", "gaussian", "kalman"
+  gaussian_sigma: 15.0
+  
+  # Adaptive smoothing
+  adaptive_smoothing: 1
+  min_smoothing_radius: 10
+  max_smoothing_radius: 50
+  
+  # Outlier rejection
+  outlier_rejection: true
+  outlier_threshold: 3.0
+  
+  # Motion prediction
+  motion_prediction: 1
+  intentional_motion_threshold: 0.8
+  
+  # Region of Interest
+  use_roi: true
+  roi_x: 96       # Reduced from 320 to capture more of the left side
+  roi_y: 54       # Reduced from 180 to capture more of the top
+  roi_width: 1728 # Increased from 640 to cover 90% of frame width (1920*0.9)
+  roi_height: 972 # Increased from 360 to cover 90% of frame height (1080*0.9)
+  
+  # Horizon lock
+  horizon_lock: true
+  
+  # Feature detector (0=GFTT, 1=ORB, 2=FAST, 3=BRISK)
+  feature_detector_type: 1
+  fast_threshold: 20
+  orb_features: 2000
+
+
+
+deepstream_tracker:
+  model_engine: "/home/orin/Developer/deepstream_engines/best.engine"
+  model_config_file: "/home/orin/Developer/deepstream_engines/visconf.txt"
+  tracker_config_file: "/opt/nvidia/deepstream/deepstream-7.1/samples/configs/deepstream-app/config_tracker_NvDCF_perf.yml"
+  processing_width: 960
+  processing_height: 544
+  confidence_threshold: 0.1
+  batch_size: 1
+  debug_mode: true

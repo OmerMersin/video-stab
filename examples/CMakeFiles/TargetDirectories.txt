@@ -1,0 +1,7 @@
+/home/orin/Developer/StabC/v2/libtracker/examples/CMakeFiles/video-stab.dir
+/home/orin/Developer/StabC/v2/libtracker/examples/CMakeFiles/edit_cache.dir
+/home/orin/Developer/StabC/v2/libtracker/examples/CMakeFiles/rebuild_cache.dir
+/home/orin/Developer/StabC/v2/libtracker/examples/CMakeFiles/list_install_components.dir
+/home/orin/Developer/StabC/v2/libtracker/examples/CMakeFiles/install.dir
+/home/orin/Developer/StabC/v2/libtracker/examples/CMakeFiles/install/local.dir
+/home/orin/Developer/StabC/v2/libtracker/examples/CMakeFiles/install/strip.dir
