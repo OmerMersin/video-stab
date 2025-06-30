@@ -6,9 +6,9 @@ mode:
   height:  360
   optimize_fps:  1
   use_cuda:  1
-  enhancer_enabled:                                                                                                                                  0
-  roll_correction_enabled:                                                                                                                                  0
-  stabilizer_enabled:                                                                                                                                  0
+  enhancer_enabled:  0
+  roll_correction_enabled:  0
+  stabilizer_enabled:  0
 
 camera:
   threaded_queue_mode:  true

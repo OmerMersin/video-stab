@@ -36,8 +36,9 @@ namespace vs {
                 std::cout << "[CamCap] RTSP stream detected! Using GStreamer pipeline." << std::endl;
             }
 
-            std::string gst_pipeline = "rtspsrc location=" + params.source + " latency=0 ! "
-                                    "rtph265depay ! avdec_h265 ! videoconvert ! appsink";
+std::string gst_pipeline = "rtspsrc location=" + params.source + " latency=0 protocols=udp drop-on-latency=true ! "
+                           "rtph265depay ! h265parse ! nvv4l2decoder ! nvvidconv ! video/x-raw, format=NV12 ! appsink";
+
 
             cap.open(gst_pipeline, cv::CAP_GSTREAMER);
         }
