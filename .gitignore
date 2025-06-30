@@ -1,0 +1,7 @@
+# ignore common raw video files
+*.mp4
+*.h264
+*.mkv
+*.mov
+*.avi
+*.m4v
