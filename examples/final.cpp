@@ -24,6 +24,8 @@
 #include <unistd.h>
 #include <memory>  // For std::unique_ptr
 #include <gst/app/gstappsrc.h>
+#include <gst/gst.h>
+#include <future>  // For std::async
 
 // Global variable for signal handling
 volatile sig_atomic_t stopRequested = 0;
@@ -32,6 +34,381 @@ void signalHandler(int signum) {
     std::cout << "\nReceived signal " << signum << ", shutting down gracefully..." << std::endl;
     stopRequested = 1;
 }
+
+// GStreamer-based passthrough class for efficient RTSP restreaming
+class GStreamerPassthrough {
+public:  // Make these public so busCallback can access them
+    GstElement* pipeline;
+    GMainLoop* loop;
+    bool isRunning;
+    
+private:
+    std::thread* loopThread;
+    std::string sourceUri;
+    std::string outputUri;
+    
+    static gboolean busCallback(GstBus* bus, GstMessage* msg, gpointer data) {
+        GStreamerPassthrough* passthrough = static_cast<GStreamerPassthrough*>(data);
+        
+        switch (GST_MESSAGE_TYPE(msg)) {
+            case GST_MESSAGE_ERROR: {
+                GError* err;
+                gchar* debug;
+                gst_message_parse_error(msg, &err, &debug);
+                std::cerr << "GStreamer Passthrough Error: " << err->message << std::endl;
+                if (debug) {
+                    std::cerr << "Debug info: " << debug << std::endl;
+                }
+                g_error_free(err);
+                g_free(debug);
+                
+                // Set flag to stop instead of calling stop() directly to avoid deadlock
+                passthrough->isRunning = false;
+                if (passthrough->loop && g_main_loop_is_running(passthrough->loop)) {
+                    g_main_loop_quit(passthrough->loop);
+                }
+                break;
+            }
+            case GST_MESSAGE_WARNING: {
+                GError* err;
+                gchar* debug;
+                gst_message_parse_warning(msg, &err, &debug);
+                std::cout << "GStreamer Passthrough Warning: " << err->message << std::endl;
+                if (debug) {
+                    std::cout << "Debug info: " << debug << std::endl;
+                }
+                g_error_free(err);
+                g_free(debug);
+                break;
+            }
+            case GST_MESSAGE_INFO: {
+                GError* err;
+                gchar* debug;
+                gst_message_parse_info(msg, &err, &debug);
+                std::cout << "GStreamer Passthrough Info: " << err->message << std::endl;
+                if (debug) {
+                    std::cout << "Debug info: " << debug << std::endl;
+                }
+                g_error_free(err);
+                g_free(debug);
+                break;
+            }
+            case GST_MESSAGE_QOS: {
+                // Quality of Service - important for detecting frame drops/glitches
+                GstFormat format;
+                guint64 processed, dropped;
+                gst_message_parse_qos_stats(msg, &format, &processed, &dropped);
+                if (dropped > 0) {
+                    std::cout << "QoS: Dropped " << dropped << " frames (processed: " << processed << ")" << std::endl;
+                }
+                break;
+            }
+            case GST_MESSAGE_LATENCY:
+                std::cout << "Latency message received - redistributing latency" << std::endl;
+                gst_bin_recalculate_latency(GST_BIN(passthrough->pipeline));
+                break;
+            case GST_MESSAGE_BUFFERING: {
+                gint percent;
+                gst_message_parse_buffering(msg, &percent);
+                if (percent < 100) {
+                    std::cout << "Buffering: " << percent << "%" << std::endl;
+                }
+                break;
+            }
+            case GST_MESSAGE_EOS:
+                std::cout << "GStreamer Passthrough: End of stream" << std::endl;
+                passthrough->isRunning = false;
+                if (passthrough->loop && g_main_loop_is_running(passthrough->loop)) {
+                    g_main_loop_quit(passthrough->loop);
+                }
+                break;
+            case GST_MESSAGE_STATE_CHANGED: {
+                if (GST_MESSAGE_SRC(msg) == GST_OBJECT(passthrough->pipeline)) {
+                    GstState oldState, newState, pendingState;
+                    gst_message_parse_state_changed(msg, &oldState, &newState, &pendingState);
+                    std::cout << "GStreamer Passthrough: State changed from " 
+                              << gst_element_state_get_name(oldState) << " to " 
+                              << gst_element_state_get_name(newState) << std::endl;
+                }
+                break;
+            }
+            default:
+                break;
+        }
+        return TRUE;
+    }
+    
+    void runLoop() {
+        g_main_loop_run(loop);
+    }
+    
+public:
+    GStreamerPassthrough(const std::string& source, const std::string& output) 
+        : pipeline(nullptr), loop(nullptr), loopThread(nullptr), isRunning(false),
+          sourceUri(source), outputUri(output) {
+        gst_init(nullptr, nullptr);
+        
+        // Set GStreamer environment for ultra-low latency (matching FFmpeg behavior)
+        g_setenv("GST_RTSP_LATENCY", "0", TRUE);
+        g_setenv("GST_BUFFER_POOL_MAX_SIZE", "2", TRUE);
+        g_setenv("GST_RTP_JITTERBUFFER_LATENCY", "0", TRUE);
+    }
+    
+    ~GStreamerPassthrough() {
+        stop();
+    }
+    
+    bool start() {
+        if (isRunning) {
+            std::cout << "GStreamer Passthrough already running" << std::endl;
+            return true;
+        }
+        
+        std::cout << "Starting GStreamer Passthrough..." << std::endl;
+        std::cout << "Source: " << sourceUri << std::endl;
+        std::cout << "Output: " << outputUri << std::endl;
+        
+        // Try different pipeline strategies in order of preference
+        // Optimized to match FFmpeg's -fflags nobuffer -flags low_delay -c copy behavior
+        std::vector<std::string> pipelineStrategies = {
+            // Strategy 1: Ultra-minimal H.265 pipeline - closest to FFmpeg's direct copy
+            "rtspsrc location=" + sourceUri + " protocols=udp "
+            "latency=0 buffer-mode=none drop-on-latency=true "
+            "ntp-sync=false do-rtcp=false timeout=2000000 tcp-timeout=2000000 ! "
+            "rtph265depay ! "
+            "h265parse disable-passthrough=true config-interval=-1 ! "
+            "video/x-h265,stream-format=byte-stream,alignment=au ! "
+            "rtspclientsink location=" + outputUri + " protocols=tcp "
+            "latency=0 async=false sync=false",
+            
+            // Strategy 2: Ultra-minimal H.264 pipeline - closest to FFmpeg's direct copy
+            "rtspsrc location=" + sourceUri + " protocols=udp "
+            "latency=0 buffer-mode=none drop-on-latency=true "
+            "ntp-sync=false do-rtcp=false timeout=2000000 tcp-timeout=2000000 ! "
+            "rtph264depay ! "
+            "h264parse disable-passthrough=true config-interval=-1 ! "
+            "video/x-h264,stream-format=byte-stream,alignment=au ! "
+            "rtspclientsink location=" + outputUri + " protocols=tcp "
+            "latency=0 async=false sync=false",
+            
+            // Strategy 3: No jitter buffer, direct passthrough - matches FFmpeg -fflags nobuffer
+            "rtspsrc location=" + sourceUri + " protocols=udp "
+            "latency=0 buffer-mode=none drop-on-latency=true "
+            "ntp-sync=false do-rtcp=false ! "
+            "application/x-rtp ! "
+            "rtpjitterbuffer mode=none latency=0 drop-on-latency=true ! "
+            "rtph265depay ! identity sync=false ! "
+            "rtspclientsink location=" + outputUri + " protocols=tcp "
+            "latency=0 async=false sync=false",
+            
+            // Strategy 4: Auto-detect codec with zero buffering
+            "rtspsrc location=" + sourceUri + " protocols=udp "
+            "latency=0 buffer-mode=none drop-on-latency=true "
+            "ntp-sync=false do-rtcp=false ! "
+            "rtpjitterbuffer mode=none latency=0 drop-on-latency=true ! "
+            "parsebin ! identity sync=false ! "
+            "rtspclientsink location=" + outputUri + " protocols=tcp "
+            "latency=0 async=false sync=false",
+            
+            // Strategy 5: Fallback with minimal processing (UDP+TCP protocols)
+            "rtspsrc location=" + sourceUri + " protocols=udp+tcp "
+            "latency=0 buffer-mode=slave drop-on-latency=true "
+            "ntp-sync=false do-rtcp=false ! "
+            "rtpjitterbuffer mode=slave latency=0 drop-on-latency=true ! "
+            "parsebin ! identity sync=false ! "
+            "rtspclientsink location=" + outputUri + " protocols=tcp "
+            "latency=0 async=false sync=false"
+        };
+        
+        GError* error = nullptr;
+        bool pipelineCreated = false;
+        
+        for (size_t i = 0; i < pipelineStrategies.size() && !pipelineCreated; i++) {
+            std::cout << "Trying pipeline strategy " << (i + 1) << "..." << std::endl;
+            std::cout << "Pipeline: " << pipelineStrategies[i] << std::endl;
+            
+            if (error) {
+                g_error_free(error);
+                error = nullptr;
+            }
+            
+            pipeline = gst_parse_launch(pipelineStrategies[i].c_str(), &error);
+            if (pipeline && !error) {
+                // Apply ultra-low latency settings to individual elements
+                setUltraLowLatencyProperties(pipeline);
+                pipelineCreated = true;
+                std::cout << "Pipeline strategy " << (i + 1) << " created successfully!" << std::endl;
+            } else {
+                if (pipeline) {
+                    gst_object_unref(pipeline);
+                    pipeline = nullptr;
+                }
+                std::cout << "Pipeline strategy " << (i + 1) << " failed";
+                if (error) {
+                    std::cout << ": " << error->message;
+                }
+                std::cout << std::endl;
+            }
+        }
+        
+        if (!pipelineCreated) {
+            std::cerr << "All pipeline strategies failed!" << std::endl;
+            if (error) {
+                g_error_free(error);
+            }
+            return false;
+        }
+        
+        // Set up bus callback
+        GstBus* bus = gst_element_get_bus(pipeline);
+        gst_bus_add_watch(bus, busCallback, this);
+        gst_object_unref(bus);
+        
+        // Create main loop
+        loop = g_main_loop_new(nullptr, FALSE);
+        
+        // Start pipeline
+        GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+        if (ret == GST_STATE_CHANGE_FAILURE) {
+            std::cerr << "Failed to start GStreamer pipeline" << std::endl;
+            cleanup();
+            return false;
+        }
+        
+        // Start main loop in separate thread
+        isRunning = true;
+        loopThread = new std::thread(&GStreamerPassthrough::runLoop, this);
+        
+        std::cout << "GStreamer Passthrough started successfully!" << std::endl;
+        return true;
+    }
+    
+    void stop() {
+        if (!isRunning) return;
+        
+        std::cout << "Stopping GStreamer Passthrough..." << std::endl;
+        isRunning = false;
+        
+        // Stop pipeline first
+        if (pipeline) {
+            gst_element_set_state(pipeline, GST_STATE_NULL);
+        }
+        
+        // Stop main loop
+        if (loop && g_main_loop_is_running(loop)) {
+            g_main_loop_quit(loop);
+        }
+        
+        // Wait for loop thread to finish with timeout
+        if (loopThread && loopThread->joinable()) {
+            // Give it 2 seconds to finish gracefully
+            auto future = std::async(std::launch::async, [this]() {
+                loopThread->join();
+            });
+            
+            if (future.wait_for(std::chrono::seconds(2)) == std::future_status::timeout) {
+                std::cout << "Thread join timeout, detaching..." << std::endl;
+                loopThread->detach();
+            }
+            
+            delete loopThread;
+            loopThread = nullptr;
+        }
+        
+        cleanup();
+        std::cout << "GStreamer Passthrough stopped." << std::endl;
+    }
+    
+    bool isActive() const {
+        return isRunning;
+    }
+    
+private:
+    void cleanup() {
+        if (pipeline) {
+            gst_element_set_state(pipeline, GST_STATE_NULL);
+            gst_object_unref(pipeline);
+            pipeline = nullptr;
+        }
+        
+        if (loop) {
+            g_main_loop_unref(loop);
+            loop = nullptr;
+        }
+    }
+    
+    // Function to set ultra-low latency properties on pipeline elements
+    void setUltraLowLatencyProperties(GstElement* pipeline) {
+        GstIterator* iter = gst_bin_iterate_elements(GST_BIN(pipeline));
+        GValue item = G_VALUE_INIT;
+        
+        while (gst_iterator_next(iter, &item) == GST_ITERATOR_OK) {
+            GstElement* element = GST_ELEMENT(g_value_get_object(&item));
+            const gchar* elementName = gst_element_get_name(element);
+            const gchar* factoryName = GST_OBJECT_NAME(gst_element_get_factory(element));
+            
+            std::cout << "Configuring element: " << factoryName << " (" << elementName << ")" << std::endl;
+            
+            // Configure rtspsrc for ultra-low latency
+            if (g_str_has_prefix(factoryName, "rtspsrc")) {
+                g_object_set(element, 
+                    "latency", 0,
+                    "buffer-mode", 4,  // none
+                    "drop-on-latency", TRUE,
+                    "ntp-sync", FALSE,
+                    "do-rtcp", FALSE,
+                    "timeout", G_GUINT64_CONSTANT(2000000),  // 2s
+                    "tcp-timeout", G_GUINT64_CONSTANT(2000000),  // 2s
+                    "retry", 3,
+                    NULL);
+            }
+            // Configure rtpjitterbuffer for zero buffering
+            else if (g_str_has_prefix(factoryName, "rtpjitterbuffer")) {
+                g_object_set(element,
+                    "latency", 0,
+                    "drop-on-latency", TRUE,
+                    "mode", 0,  // none/slave
+                    NULL);
+            }
+            // Configure rtspclientsink for immediate output
+            else if (g_str_has_prefix(factoryName, "rtspclientsink")) {
+                g_object_set(element,
+                    "latency", 0,
+                    "async", FALSE,
+                    "sync", FALSE,
+                    NULL);
+            }
+            // Configure any queue elements for minimal buffering
+            else if (g_str_has_prefix(factoryName, "queue")) {
+                g_object_set(element,
+                    "max-size-buffers", 1,
+                    "max-size-bytes", 0,
+                    "max-size-time", G_GUINT64_CONSTANT(0),
+                    "leaky", 2,  // downstream
+                    NULL);
+            }
+            // Configure depayloaders
+            else if (g_str_has_suffix(factoryName, "depay")) {
+                // Most depayloaders don't have specific latency settings, but ensure no buffering
+                g_object_set(element, "auto-header-extension", FALSE, NULL);
+            }
+            // Configure parsers for passthrough mode
+            else if (g_str_has_suffix(factoryName, "parse")) {
+                if (g_str_has_prefix(factoryName, "h264parse") || g_str_has_prefix(factoryName, "h265parse")) {
+                    g_object_set(element,
+                        "disable-passthrough", TRUE,
+                        "config-interval", -1,
+                        NULL);
+                }
+            }
+            
+            g_value_unset(&item);
+        }
+        
+        gst_iterator_free(iter);
+        std::cout << "Ultra-low latency properties applied to all elements" << std::endl;
+    }
+};
 
 // Function to read configurations from a YAML file
 bool readConfig(
@@ -234,7 +611,7 @@ int main(int argc, char** argv) {
     cam->start();
     
     // Initialize tracker and TCP receiver for tracking coordinates
-    vs::DeepStreamTracker tracker(trackerParams);
+    std::unique_ptr<vs::DeepStreamTracker> tracker = std::make_unique<vs::DeepStreamTracker>(trackerParams);
     vs::TcpReciever tcp(5000);   // listen on port 5000
     tcp.start();
     int x = -1, y = -1;  // Tracking coordinates
@@ -258,8 +635,7 @@ int main(int argc, char** argv) {
     std::cout << "Frame dimensions: " << frameWidth << "x" << frameHeight << std::endl;
 
     // Initialize variables for different modes
-    FILE* passthroughProcess = nullptr;
-    pid_t passthroughPid = -1;
+    std::unique_ptr<GStreamerPassthrough> passthroughStreamer;
     
     // Frame buffer management for streaming
     const int maxBufferedFrames = 2;  // Keep buffer very small for low latency
@@ -272,67 +648,124 @@ int main(int argc, char** argv) {
                          !runParams.trackerEnabled;
     
     if (usePassthrough && videoSource.find("rtsp://") == 0) {
-        std::cout << "No processing enabled - using ultra-low latency passthrough mode" << std::endl;
+        std::cout << "No processing enabled - using ultra-low latency GStreamer passthrough mode" << std::endl;
         std::cout << "Make sure MediaMTX is running on port 8554" << std::endl;
         
-        // Build FFmpeg passthrough command exactly like your working version
-        std::stringstream passthroughCmd;
-        passthroughCmd << "ffmpeg -loglevel warning "
-                      << "-fflags nobuffer -flags low_delay "
-                      << "-rtsp_transport udp "  // Use UDP as in your working command
-                      << "-i " << videoSource << " "
-                      << "-c copy "  // Copy without re-encoding for minimal latency
-                      << "-f rtsp -rtsp_transport tcp "
-                      << "rtsp://localhost:8554/forwarded";
+        // Create and start GStreamer passthrough
+        passthroughStreamer = std::make_unique<GStreamerPassthrough>(
+            videoSource, 
+            "rtsp://localhost:8554/forwarded"
+        );
         
-        std::cout << "Starting passthrough with command: " << passthroughCmd.str() << std::endl;
-        
-        // Start FFmpeg passthrough process
-        passthroughProcess = popen(passthroughCmd.str().c_str(), "r");
-        if (!passthroughProcess) {
-            std::cerr << "Failed to start passthrough process, falling back to frame processing" << std::endl;
-        } else {
-            std::cout << "Passthrough mode active - press Ctrl+C to stop" << std::endl;
+        if (passthroughStreamer->start()) {
+            std::cout << "GStreamer passthrough mode active - press Ctrl+C to stop" << std::endl;
             
-            // Use non-blocking read to check for signals
-            fd_set readfds;
-            struct timeval timeout;
-            int fd = fileno(passthroughProcess);
-            char buffer[256];
-            
-            while (!stopRequested) {
-                FD_ZERO(&readfds);
-                FD_SET(fd, &readfds);
-                timeout.tv_sec = 1;  // 1 second timeout
-                timeout.tv_usec = 0;
+            // Monitor for config changes and stop signal
+            while (!stopRequested && passthroughStreamer->isActive()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
                 
-                int result = select(fd + 1, &readfds, NULL, NULL, &timeout);
-                
-                if (result > 0 && FD_ISSET(fd, &readfds)) {
-                    if (fgets(buffer, sizeof(buffer), passthroughProcess) != nullptr) {
-                        // Print FFmpeg output for debugging
-                        if (strlen(buffer) > 1) {
-                            std::cout << "FFmpeg: " << buffer;
+                // Check for config changes periodically
+                static int passthroughConfigCounter = 0;
+                if (passthroughConfigCounter++ % 5 == 0) {  // Check every 5 seconds
+                    if (stat(configFile.c_str(), &configStat) == 0) {
+                        if (configStat.st_mtime != lastConfigModTime) {
+                            std::cout << "\n=== Config file changed in passthrough mode ===" << std::endl;
+                            
+                            if (readConfig(configFile, videoSource, runParams, enhancerParams, rollParams, stabParams, camParams, trackerParams)) {
+                                lastConfigModTime = configStat.st_mtime;
+                                
+                                bool newUsePassthrough = !runParams.enhancerEnabled && 
+                                                       !runParams.rollCorrectionEnabled && 
+                                                       !runParams.stabilizationEnabled &&
+                                                       !runParams.trackerEnabled;
+                                
+                                if (!newUsePassthrough) {
+                                    std::cout << "Processing enabled - exiting passthrough mode" << std::endl;
+                                    std::cout << "Enhancer: " << (runParams.enhancerEnabled ? "Enabled" : "Disabled") << std::endl;
+                                    std::cout << "Roll Correction: " << (runParams.rollCorrectionEnabled ? "Enabled" : "Disabled") << std::endl;
+                                    std::cout << "Stabilizer: " << (runParams.stabilizationEnabled ? "Enabled" : "Disabled") << std::endl;
+                                    std::cout << "Tracker: " << (runParams.trackerEnabled ? "Enabled" : "Disabled") << std::endl;
+                                    
+                                    // Stop passthrough
+                                    passthroughStreamer->stop();
+                                    passthroughStreamer.reset();
+                                    
+                                    // Clean shutdown to avoid conflicts
+                                    std::cout << "Stopping camera for mode transition..." << std::endl;
+                                    if (cam) {
+                                        cam->stop();
+                                        cam.reset();  // Clean shutdown
+                                    }
+                                    
+                                    // Wait for clean shutdown
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                                    
+                                    // Exit passthrough mode
+                                    usePassthrough = false;
+                                    break;
+                                } else {
+                                    std::cout << "Still in passthrough mode - no processing enabled" << std::endl;
+                                }
+                            } else {
+                                std::cerr << "Failed to reload configuration in passthrough mode." << std::endl;
+                            }
                         }
-                    } else {
-                        // Process ended
-                        break;
                     }
-                } else if (result < 0) {
-                    // Error occurred
-                    break;
-                }
-                
-                // Check if we should exit
-                if (stopRequested) {
-                    std::cout << "Stopping passthrough mode..." << std::endl;
-                    break;
                 }
             }
             
-            int exitCode = pclose(passthroughProcess);
-            std::cout << "Passthrough process ended with code: " << exitCode << std::endl;
-            return 0;
+            if (passthroughStreamer) {
+                passthroughStreamer->stop();
+                passthroughStreamer.reset();
+            }
+            
+            // If we exited passthrough due to config change, continue to processing mode
+            if (!usePassthrough) {
+                std::cout << "Transitioning from passthrough to processing mode..." << std::endl;
+                
+                // Reinitialize all components for processing mode
+                std::cout << "Reinitializing components for processing mode..." << std::endl;
+                
+                // 1. Reinitialize camera with updated parameters
+                camParams.source = videoSource;
+                cam = std::make_unique<vs::CamCap>(camParams);
+                cam->start();
+                
+                // 2. Update frame parameters
+                fps = cam->getFrameRate();
+                if (fps < 1.0) fps = 30.0;
+                frameWidth = static_cast<int>(cam->getWidth());
+                frameHeight = static_cast<int>(cam->getHeight());
+                
+                if (runParams.width > 0 && runParams.height > 0) {
+                    frameWidth = runParams.width;
+                    frameHeight = runParams.height;
+                }
+                
+                std::cout << "Processing mode - Video framerate: " << fps << " FPS" << std::endl;
+                std::cout << "Processing mode - Frame dimensions: " << frameWidth << "x" << frameHeight << std::endl;
+                
+                // 3. Reinitialize stabilizer if needed
+                if (runParams.stabilizationEnabled) {
+                    stab = vs::Stabilizer(stabParams);
+                }
+                
+                // 4. Make sure tracker is properly initialized if needed
+                if (runParams.trackerEnabled) {
+                    try {
+                        tracker = std::make_unique<vs::DeepStreamTracker>(trackerParams);
+                    } catch (const std::exception& e) {
+                        std::cerr << "Failed to initialize tracker: " << e.what() << std::endl;
+                    }
+                }
+                
+                std::cout << "Component reinitialization complete!" << std::endl;
+                // Don't return, continue to processing mode below
+            } else {
+                return 0;  // Normal exit
+            }
+        } else {
+            std::cerr << "Failed to start GStreamer passthrough, falling back to frame processing" << std::endl;
         }
     }
 
@@ -501,10 +934,66 @@ int main(int argc, char** argv) {
                                                !runParams.rollCorrectionEnabled && 
                                                !runParams.stabilizationEnabled;
                         
-                        if (shouldRestart(usePassthrough, newUsePassthrough)) {
-                            std::cout << "Processing mode changed - restart required for optimal performance" << std::endl;
-                            std::cout << "New mode: " << (newUsePassthrough ? "Passthrough" : "Processing") << std::endl;
-                            // Note: We continue with current mode for now, full restart would be needed for mode switch
+                        if (newUsePassthrough && !usePassthrough && videoSource.find("rtsp://") == 0) {
+                            std::cout << "Switching to passthrough mode for optimal performance" << std::endl;
+                            
+                            // Stop all processing components cleanly
+                            std::cout << "Stopping all processing components..." << std::endl;
+                            
+                            // Stop tracker first
+                            std::cout << "Stopping tracker..." << std::endl;
+                            tracker.reset();
+                            std::cout << "Tracker stopped." << std::endl;
+                            
+                            // Stop camera
+                            std::cout << "Stopping camera..." << std::endl;
+                            cam->stop();
+                            cam.reset();
+                            std::cout << "Camera stopped." << std::endl;
+                            
+                            // Stop GStreamer pipeline
+                            if (appsrc && pipeline) {
+                                std::cout << "Stopping GStreamer pipeline..." << std::endl;
+                                gst_element_set_state(pipeline, GST_STATE_NULL);
+                                gst_object_unref(pipeline);
+                                pipeline = nullptr;
+                                appsrc = nullptr;
+                                std::cout << "GStreamer pipeline stopped." << std::endl;
+                            }
+                            
+                            std::cout << "All processing components stopped." << std::endl;
+                            
+                            // Start GStreamer passthrough mode
+                            passthroughStreamer = std::make_unique<GStreamerPassthrough>(
+                                videoSource, 
+                                "rtsp://localhost:8554/forwarded"
+                            );
+                            
+                            if (passthroughStreamer->start()) {
+                                std::cout << "GStreamer passthrough activated successfully!" << std::endl;
+                                usePassthrough = true;
+                                
+                                // Exit the processing loop to run passthrough
+                                std::cout << "Exiting processing loop for passthrough mode..." << std::endl;
+                                break;
+                            } else {
+                                std::cerr << "Failed to start GStreamer passthrough, restarting processing components..." << std::endl;
+                                
+                                // Restart processing components
+                                camParams.source = videoSource;
+                                cam = std::make_unique<vs::CamCap>(camParams);
+                                cam->start();
+                                
+                                // Reinitialize tracker if needed
+                                if (runParams.trackerEnabled) {
+                                    tracker = std::make_unique<vs::DeepStreamTracker>(trackerParams);
+                                }
+                                
+                                // Restart GStreamer pipeline
+                                buildStreamer();
+                            }
+                        } else if (!newUsePassthrough && usePassthrough) {
+                            std::cout << "Note: Processing mode enabled but currently in passthrough - restart recommended for optimal performance" << std::endl;
                         }
                         
                         std::cout << "=== Configuration reloaded successfully ===" << std::endl;
@@ -570,9 +1059,9 @@ int main(int argc, char** argv) {
         }
         
         // Apply Tracking
-        if (runParams.trackerEnabled) {
+        if (runParams.trackerEnabled && tracker) {
             // Process frame through tracker
-            auto detections = tracker.processFrame(*framePtr);
+            auto detections = tracker->processFrame(*framePtr);
             
             // Check for new tracking coordinates from TCP
             if (tcp.tryGetLatest(x, y)) {
@@ -580,7 +1069,7 @@ int main(int argc, char** argv) {
                           << detections.size() << " detections available" << std::endl;
                 
                 // Draw detections with the selected coordinates
-                cv::Mat trackedFrame = tracker.drawDetections(*framePtr, detections, x, y);
+                cv::Mat trackedFrame = tracker->drawDetections(*framePtr, detections, x, y);
                 if (framePtr == &tempFrame3) {
                     tempFrame3 = trackedFrame;  // Update the existing frame
                 } else {
@@ -589,7 +1078,7 @@ int main(int argc, char** argv) {
                 }
             } else {
                 // No new coordinates, use previous selection
-                cv::Mat trackedFrame = tracker.drawDetections(*framePtr, detections, -1, -1);
+                cv::Mat trackedFrame = tracker->drawDetections(*framePtr, detections, -1, -1);
                 if (framePtr == &tempFrame3) {
                     tempFrame3 = trackedFrame;  // Update the existing frame
                 } else {
@@ -714,6 +1203,46 @@ int main(int argc, char** argv) {
         }
     }
     
+    // If we switched to passthrough mode, run the passthrough loop
+    if (usePassthrough && passthroughStreamer) {
+        std::cout << "Entering passthrough mode loop..." << std::endl;
+        
+        // Simple monitoring loop for passthrough mode
+        while (!stopRequested && passthroughStreamer->isActive()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            
+            // Check for config changes periodically
+            static int passthroughConfigCounter = 0;
+            if (passthroughConfigCounter++ % 10 == 0) {  // Check every ~10 seconds
+                if (stat(configFile.c_str(), &configStat) == 0) {
+                    if (configStat.st_mtime != lastConfigModTime) {
+                        std::cout << "\n=== Config changed in passthrough mode ===" << std::endl;
+                        
+                        if (readConfig(configFile, videoSource, runParams, enhancerParams, rollParams, stabParams, camParams, trackerParams)) {
+                            lastConfigModTime = configStat.st_mtime;
+                            
+                            bool newUsePassthrough = !runParams.enhancerEnabled && 
+                                                   !runParams.rollCorrectionEnabled && 
+                                                   !runParams.stabilizationEnabled &&
+                                                   !runParams.trackerEnabled;
+                            
+                            if (!newUsePassthrough) {
+                                std::cout << "Processing enabled - exiting passthrough mode" << std::endl;
+                                passthroughStreamer->stop();
+                                passthroughStreamer.reset();
+                                break;
+                            } else {
+                                std::cout << "Still in passthrough mode" << std::endl;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        std::cout << "Passthrough mode loop ended" << std::endl;
+    }
+    
     std::cout << "Cleaning up resources..." << std::endl;
     
     // Stop camera capture
@@ -733,12 +1262,12 @@ int main(int argc, char** argv) {
     // Stop TCP receiver
     tcp.stop();
     
-    // Cleanup passthrough process
-    if (passthroughProcess) {
-        std::cout << "Closing passthrough process..." << std::endl;
-        int exitCode = pclose(passthroughProcess);
-        std::cout << "Passthrough process closed with code: " << exitCode << std::endl;
-        passthroughProcess = nullptr;
+    // Cleanup GStreamer passthrough
+    if (passthroughStreamer) {
+        std::cout << "Stopping GStreamer passthrough..." << std::endl;
+        passthroughStreamer->stop();
+        passthroughStreamer.reset();
+        std::cout << "GStreamer passthrough stopped." << std::endl;
     }
     
     cv::destroyAllWindows();
