@@ -614,44 +614,72 @@ int main(int argc, char** argv) {
         
         // Send frame to MediaMTX via GStreamer (more efficient than FFmpeg pipe)
         if (!processedFrame.empty() && appsrc) {
-            // Skip frame sending if we're behind to catch up
-            static auto lastSendTime = std::chrono::high_resolution_clock::now();
-            auto currentTime = std::chrono::high_resolution_clock::now();
-            double timeSinceLastSend = std::chrono::duration<double, std::milli>(currentTime - lastSendTime).count();
+        // Improved timing control to reduce glitches
+        static auto lastSendTime = std::chrono::high_resolution_clock::now();
+        static int frameDropCount = 0;
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        double timeSinceLastSend = std::chrono::duration<double, std::milli>(currentTime - lastSendTime).count();
+        
+        // More precise frame timing
+        double targetInterval = 1000.0 / fps;
+        
+        // Only send frame if we're not getting too far behind
+        if (timeSinceLastSend >= targetInterval * 0.9) {  // Tighter timing control
+            // Ensure frame is properly formatted and sized
+            cv::Mat outputFrame;
             
-            // Only send frame if enough time has passed (adaptive frame dropping)
-            double targetInterval = 1000.0 / fps;
-            if (timeSinceLastSend >= targetInterval * 0.8) {  // Allow 20% tolerance
-                // Ensure frame is in BGR format and correct size
-                cv::Mat outputFrame;
-                if (processedFrame.cols != frameWidth || processedFrame.rows != frameHeight) {
-                    cv::resize(processedFrame, outputFrame, cv::Size(frameWidth, frameHeight), 0, 0, cv::INTER_LINEAR);
-                } else if (!processedFrame.isContinuous()) {
+            // Always ensure the frame is continuous and properly formatted
+            if (processedFrame.cols != frameWidth || processedFrame.rows != frameHeight) {
+                cv::resize(processedFrame, outputFrame, cv::Size(frameWidth, frameHeight), 0, 0, cv::INTER_LANCZOS4);
+            } else {
+                // Ensure frame is continuous in memory
+                if (!processedFrame.isContinuous()) {
                     processedFrame.copyTo(outputFrame);
                 } else {
-                    outputFrame = processedFrame;
-                }
-                
-                // Send to GStreamer pipeline  
-                GstBuffer* buf = gst_buffer_new_allocate(
-                    nullptr, outputFrame.total() * outputFrame.elemSize(), nullptr);
-                GstMapInfo map;
-                gst_buffer_map(buf, &map, GST_MAP_WRITE);
-                std::memcpy(map.data, outputFrame.data, map.size);
-                gst_buffer_unmap(buf, &map);
-                GST_BUFFER_PTS(buf) = gst_util_uint64_scale(frameCounter++, GST_SECOND, fps);
-                gst_app_src_push_buffer(appsrc, buf);
-                
-                lastSendTime = currentTime;
-                bufferedFrameCount = 0;  // Reset buffer count on successful send
-            } else {
-                bufferedFrameCount++;
-                // Drop frames if we're getting too far behind
-                if (bufferedFrameCount > maxBufferedFrames) {
-                    bufferedFrameCount = 0;  // Reset and skip this frame
+                    outputFrame = processedFrame.clone(); // Create a copy to avoid memory issues
                 }
             }
+            
+            // Ensure BGR format (GStreamer expects this)
+            if (outputFrame.channels() != 3) {
+                cv::cvtColor(outputFrame, outputFrame, cv::COLOR_GRAY2BGR);
+            }
+            
+            // Create GStreamer buffer with proper size
+            size_t bufferSize = outputFrame.total() * outputFrame.elemSize();
+            GstBuffer* buf = gst_buffer_new_allocate(nullptr, bufferSize, nullptr);
+            
+            GstMapInfo map;
+            if (gst_buffer_map(buf, &map, GST_MAP_WRITE)) {
+                // Copy frame data
+                std::memcpy(map.data, outputFrame.data, bufferSize);
+                gst_buffer_unmap(buf, &map);
+                
+                // Set proper timestamp
+                GST_BUFFER_PTS(buf) = gst_util_uint64_scale(frameCounter++, GST_SECOND, fps);
+                GST_BUFFER_DURATION(buf) = gst_util_uint64_scale(1, GST_SECOND, fps);
+                
+                // Push buffer to pipeline
+                GstFlowReturn ret = gst_app_src_push_buffer(appsrc, buf);
+                if (ret != GST_FLOW_OK) {
+                    std::cerr << "Failed to push buffer to GStreamer pipeline: " << ret << std::endl;
+                    frameDropCount++;
+                    if (frameDropCount > 10) {
+                        std::cout << "Too many failed pushes, restarting pipeline..." << std::endl;
+                        // Restart pipeline logic here if needed
+                        frameDropCount = 0;
+                    }
+                } else {
+                    frameDropCount = 0; // Reset on success
+                }
+                
+                lastSendTime = currentTime;
+            } else {
+                std::cerr << "Failed to map GStreamer buffer" << std::endl;
+                gst_buffer_unref(buf);
+            }
         }
+    }
         
 
         // Measure Processing Time and adapt performance

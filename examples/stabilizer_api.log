@@ -745,3 +745,29 @@ re.error: invalid group reference 11 at position 1
 2025-06-18 11:08:00,011 - stabilizer_api - INFO - Updated 3 parameters: mode -> stabilizer_enabled = 0, mode -> roll_correction_enabled = 0, mode -> enhancer_enabled = 0
 2025-06-18 11:37:51,732 - stabilizer_api - INFO - Received parameters: {'stabilizerEnabled': True, 'rollCorrectionEnabled': False, 'enhancerEnabled': False}
 2025-06-18 11:37:51,741 - stabilizer_api - INFO - Updated 3 parameters: mode -> stabilizer_enabled = 1, mode -> roll_correction_enabled = 0, mode -> enhancer_enabled = 0
+2025-06-30 14:47:08,832 - stabilizer_api - INFO - Received parameters: {'stabilizerEnabled': False, 'rollCorrectionEnabled': False, 'enhancerEnabled': True}
+2025-06-30 14:47:08,835 - stabilizer_api - INFO - Updated 3 parameters: mode -> stabilizer_enabled = 0, mode -> roll_correction_enabled = 0, mode -> enhancer_enabled = 1
+2025-06-30 14:47:10,020 - stabilizer_api - INFO - Received parameters: {'stabilizerEnabled': False, 'rollCorrectionEnabled': False, 'enhancerEnabled': False}
+2025-06-30 14:47:10,021 - stabilizer_api - INFO - Updated 3 parameters: mode -> stabilizer_enabled = 0, mode -> roll_correction_enabled = 0, mode -> enhancer_enabled = 0
+2025-06-30 14:47:11,086 - stabilizer_api - INFO - Received parameters: {'stabilizerEnabled': False, 'rollCorrectionEnabled': False, 'enhancerEnabled': True}
+2025-06-30 14:47:11,088 - stabilizer_api - INFO - Updated 3 parameters: mode -> stabilizer_enabled = 0, mode -> roll_correction_enabled = 0, mode -> enhancer_enabled = 1
+2025-06-30 14:47:12,121 - stabilizer_api - INFO - Received parameters: {'stabilizerEnabled': False, 'rollCorrectionEnabled': False, 'enhancerEnabled': False}
+2025-06-30 14:47:12,123 - stabilizer_api - INFO - Updated 3 parameters: mode -> stabilizer_enabled = 0, mode -> roll_correction_enabled = 0, mode -> enhancer_enabled = 0
+2025-06-30 14:49:28,796 - stabilizer_api - INFO - Received parameters: {'stabilizerEnabled': False, 'rollCorrectionEnabled': False, 'enhancerEnabled': True}
+2025-06-30 14:49:28,798 - stabilizer_api - INFO - Updated 3 parameters: mode -> stabilizer_enabled = 0, mode -> roll_correction_enabled = 0, mode -> enhancer_enabled = 1
+2025-06-30 14:49:29,678 - stabilizer_api - INFO - Received parameters: {'stabilizerEnabled': False, 'rollCorrectionEnabled': False, 'enhancerEnabled': False}
+2025-06-30 14:49:29,679 - stabilizer_api - INFO - Updated 3 parameters: mode -> stabilizer_enabled = 0, mode -> roll_correction_enabled = 0, mode -> enhancer_enabled = 0
+2025-06-30 14:49:56,469 - stabilizer_api - INFO - Received parameters: {'stabilizerEnabled': False, 'rollCorrectionEnabled': False, 'enhancerEnabled': True}
+2025-06-30 14:49:56,471 - stabilizer_api - INFO - Updated 3 parameters: mode -> stabilizer_enabled = 0, mode -> roll_correction_enabled = 0, mode -> enhancer_enabled = 1
+2025-06-30 14:49:57,991 - stabilizer_api - INFO - Received parameters: {'stabilizerEnabled': False, 'rollCorrectionEnabled': False, 'enhancerEnabled': False}
+2025-06-30 14:49:57,993 - stabilizer_api - INFO - Updated 3 parameters: mode -> stabilizer_enabled = 0, mode -> roll_correction_enabled = 0, mode -> enhancer_enabled = 0
+2025-06-30 14:49:58,818 - stabilizer_api - INFO - Received parameters: {'stabilizerEnabled': False, 'rollCorrectionEnabled': False, 'enhancerEnabled': True}
+2025-06-30 14:49:58,820 - stabilizer_api - INFO - Updated 3 parameters: mode -> stabilizer_enabled = 0, mode -> roll_correction_enabled = 0, mode -> enhancer_enabled = 1
+2025-06-30 14:49:59,471 - stabilizer_api - INFO - Received parameters: {'stabilizerEnabled': False, 'rollCorrectionEnabled': False, 'enhancerEnabled': False}
+2025-06-30 14:49:59,473 - stabilizer_api - INFO - Updated 3 parameters: mode -> stabilizer_enabled = 0, mode -> roll_correction_enabled = 0, mode -> enhancer_enabled = 0
+2025-06-30 14:50:39,506 - stabilizer_api - INFO - Received parameters: {'stabilizerEnabled': False, 'rollCorrectionEnabled': False, 'enhancerEnabled': True}
+2025-06-30 14:50:39,508 - stabilizer_api - INFO - Updated 3 parameters: mode -> stabilizer_enabled = 0, mode -> roll_correction_enabled = 0, mode -> enhancer_enabled = 1
+2025-06-30 14:50:42,654 - stabilizer_api - INFO - Received parameters: {'stabilizerEnabled': False, 'rollCorrectionEnabled': True, 'enhancerEnabled': True}
+2025-06-30 14:50:42,656 - stabilizer_api - INFO - Updated 3 parameters: mode -> stabilizer_enabled = 0, mode -> roll_correction_enabled = 1, mode -> enhancer_enabled = 1
+2025-06-30 14:50:44,732 - stabilizer_api - INFO - Received parameters: {'stabilizerEnabled': True, 'rollCorrectionEnabled': True, 'enhancerEnabled': True}
+2025-06-30 14:50:44,740 - stabilizer_api - INFO - Updated 3 parameters: mode -> stabilizer_enabled = 1, mode -> roll_correction_enabled = 1, mode -> enhancer_enabled = 1
