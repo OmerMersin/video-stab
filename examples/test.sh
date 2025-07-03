@@ -28,6 +28,7 @@ g++ "$FILE_NAME.cpp" -o "$FILE_NAME" \
   $(pkg-config --cflags --libs opencv4) \
   $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-rtsp-server-1.0 gstreamer-app-1.0 || echo "-L/usr/lib/aarch64-linux-gnu -lgstreamer-1.0 -lgstrtspserver-1.0 -lgstapp-1.0") \
   $(pkg-config --cflags --libs glib-2.0 gobject-2.0) \
+  $(pkg-config --cflags --libs libcurl || echo "-lcurl") \
   -I"$DEEPSTREAM_INCLUDE" -L"$DEEPSTREAM_LIB" -lnvds_meta \
   -L/usr/local/lib \
   -lvideo-stab -lopencv_core -lopencv_imgproc -lopencv_highgui -lopencv_video -lopencv_videoio \

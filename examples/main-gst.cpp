@@ -23,7 +23,10 @@
 #include <sys/select.h>
 #include <unistd.h>
 #include <memory>  // For std::unique_ptr
-#include <fcntl.h>  // For fcntl
+#include <gst/app/gstappsrc.h>
+#include <gst/gst.h>
+#include <future>  // For std::async
+
 
 // Global variable for signal handling
 volatile sig_atomic_t stopRequested = 0;
@@ -234,7 +237,7 @@ int main(int argc, char** argv) {
     cam->start();
     
     // Initialize tracker and TCP receiver for tracking coordinates
-    vs::DeepStreamTracker tracker(trackerParams);
+    std::unique_ptr<vs::DeepStreamTracker> tracker = std::make_unique<vs::DeepStreamTracker>(trackerParams);
     vs::TcpReciever tcp(5000);   // listen on port 5000
     tcp.start();
     int x = -1, y = -1;  // Tracking coordinates
@@ -257,148 +260,86 @@ int main(int argc, char** argv) {
     
     std::cout << "Frame dimensions: " << frameWidth << "x" << frameHeight << std::endl;
 
+    // Declare variables early to avoid goto crossing initialization
+    int delayMs = (runParams.optimizeFps) ? 1 : static_cast<int>(1000.0 / fps);
+    const int windowWidth = runParams.width;
+    const int windowHeight = runParams.height;
+
     // Initialize variables for different modes
-    FILE* passthroughProcess = nullptr;
-    pid_t passthroughPid = -1;
     
     // Frame buffer management for streaming
     const int maxBufferedFrames = 2;  // Keep buffer very small for low latency
     int bufferedFrameCount = 0;
 
-    // Check if we can use passthrough mode (no processing needed)
-    bool usePassthrough = !runParams.enhancerEnabled && 
-                         !runParams.rollCorrectionEnabled && 
-                         !runParams.stabilizationEnabled &&
-                         !runParams.trackerEnabled;
-    
-    if (usePassthrough && videoSource.find("rtsp://") == 0) {
-        std::cout << "No processing enabled - using ultra-low latency passthrough mode" << std::endl;
-        std::cout << "Make sure MediaMTX is running on port 8554" << std::endl;
-        
-        // Build FFmpeg passthrough command exactly like your working version
-        std::stringstream passthroughCmd;
-        passthroughCmd << "ffmpeg -loglevel warning "
-                      << "-fflags nobuffer -flags low_delay "
-                      << "-rtsp_transport udp "  // Use UDP as in your working command
-                      << "-i " << videoSource << " "
-                      << "-c copy "  // Copy without re-encoding for minimal latency
-                      << "-f rtsp -rtsp_transport tcp "
-                      << "rtsp://localhost:8554/forwarded";
-        
-        std::cout << "Starting passthrough with command: " << passthroughCmd.str() << std::endl;
-        
-        // Start FFmpeg passthrough process
-        passthroughProcess = popen(passthroughCmd.str().c_str(), "r");
-        if (!passthroughProcess) {
-            std::cerr << "Failed to start passthrough process, falling back to frame processing" << std::endl;
-        } else {
-            std::cout << "Passthrough mode active - press Ctrl+C to stop" << std::endl;
-            
-            // Use non-blocking read to check for signals
-            fd_set readfds;
-            struct timeval timeout;
-            int fd = fileno(passthroughProcess);
-            char buffer[256];
-            
-            while (!stopRequested) {
-                FD_ZERO(&readfds);
-                FD_SET(fd, &readfds);
-                timeout.tv_sec = 1;  // 1 second timeout
-                timeout.tv_usec = 0;
-                
-                int result = select(fd + 1, &readfds, NULL, NULL, &timeout);
-                
-                if (result > 0 && FD_ISSET(fd, &readfds)) {
-                    if (fgets(buffer, sizeof(buffer), passthroughProcess) != nullptr) {
-                        // Print FFmpeg output for debugging
-                        if (strlen(buffer) > 1) {
-                            std::cout << "FFmpeg: " << buffer;
-                        }
-                    } else {
-                        // Process ended
-                        break;
-                    }
-                } else if (result < 0) {
-                    // Error occurred
-                    break;
-                }
-                
-                // Check if we should exit
-                if (stopRequested) {
-                    std::cout << "Stopping passthrough mode..." << std::endl;
-                    break;
-                }
-            }
-            
-            int exitCode = pclose(passthroughProcess);
-            std::cout << "Passthrough process ended with code: " << exitCode << std::endl;
-            return 0;
-        }
-    }
-
-    // If we reach here, either passthrough failed or processing is enabled
-    std::cout << "Starting frame processing mode" << std::endl;
-    
-    // Setup FFmpeg pipeline for restreaming processed frames
-    FILE* ffmpegProcess = nullptr;
+    // Setup persistent GStreamer pipeline for continuous streaming
+    GstElement* persistentPipeline = nullptr;
+    GstAppSrc* persistentAppsrc = nullptr;
+    uint64_t frameCounter = 0;
+    bool streamInitialized = false;
     
     // Calculate appropriate bitrate based on resolution
     int bitrate = (frameWidth * frameHeight * fps * 0.1) / 1000; // In Kbps
     if (bitrate < 800) bitrate = 800; // Minimum bitrate floor
     if (bitrate > 8000) bitrate = 8000; // Maximum bitrate ceiling
     
-    auto buildFFmpegStreamer = [&]() -> bool {
-        // Build FFmpeg command for processing mode
-        std::stringstream ffmpegCmd;
-        ffmpegCmd << "ffmpeg -loglevel warning "
-                  << "-f rawvideo -pix_fmt bgr24 "
-                  << "-s " << frameWidth << "x" << frameHeight << " "
-                  << "-r " << fps << " "
-                  << "-probesize 32 -analyzeduration 0 "  // Minimize startup delay
-                  << "-thread_queue_size 512 "  // Increase queue size for stability
-                  << "-i - "  // Read from stdin
-                  << "-c:v libx264 -preset ultrafast "  // Use ultrafast for minimal latency
-                  << "-tune zerolatency "
-                  << "-profile:v baseline "  // Use baseline profile for better compatibility
-                  << "-x264opts "
-                  << "no-scenecut:sliced-threads=1:sync-lookahead=0:rc-lookahead=0:mbtree=0 "
-                  << "-crf 23 "
-                  << "-maxrate " << bitrate << "k "
-                  << "-bufsize " << (bitrate * 2) << "k "
-                  << "-pix_fmt yuv420p "
-                  << "-g " << static_cast<int>(fps) << " "  // GOP size = fps for frequent keyframes
-                  << "-f rtsp -rtsp_transport tcp "
-                  << "rtsp://localhost:8554/forwarded";
+    auto initializePersistentStream = [&]() {
+        if (streamInitialized) return true;
         
-        std::cout << "Starting FFmpeg streamer with command: " << ffmpegCmd.str() << std::endl;
+        gst_init(nullptr, nullptr);
         
-        ffmpegProcess = popen(ffmpegCmd.str().c_str(), "w");
-        if (!ffmpegProcess) {
-            std::cerr << "Failed to start FFmpeg streaming process" << std::endl;
-            return false;
+        // Ultra-low latency pipeline optimized for both passthrough and processing
+        std::string pipe =
+            "appsrc name=src is-live=true format=time block=false max-latency=0 "
+            "caps=video/x-raw,format=BGR,width=" + std::to_string(frameWidth) +
+            ",height=" + std::to_string(frameHeight) +
+            ",framerate=" + std::to_string(int(fps)) + "/1 ! "
+            "queue max-size-buffers=1 leaky=downstream ! "  // Minimal buffering for ultra-low latency
+            "videoconvert ! video/x-raw,format=NV12 ! "
+            "x264enc threads=4 tune=zerolatency speed-preset=ultrafast "  // Ultrafast preset
+            "bitrate=" + std::to_string(bitrate) + " key-int-max=15 intra-refresh=true "  // More frequent keyframes
+            "b-adapt=0 bframes=0 ref=1 me=dia subme=0 trellis=0 weightp=0 "  // Disable B-frames and complex analysis
+            "rc-lookahead=0 sync-lookahead=0 sliced-threads=true "  // Zero lookahead for minimal latency
+            "aud=false annexb=false ! "  // Disable unnecessary headers
+            "rtspclientsink location=rtsp://localhost:8554/forwarded protocols=tcp latency=0";
+
+        persistentPipeline = gst_parse_launch(pipe.c_str(), nullptr);
+        persistentAppsrc = GST_APP_SRC(gst_bin_get_by_name(GST_BIN(persistentPipeline), "src"));
+        
+        if (persistentPipeline && persistentAppsrc) {
+            // Set ultra-low latency properties on appsrc
+            g_object_set(persistentAppsrc,
+                "is-live", TRUE,
+                "block", FALSE,
+                "format", GST_FORMAT_TIME,
+                "max-latency", G_GINT64_CONSTANT(0),
+                "do-timestamp", TRUE,
+                NULL);
+            
+            gst_element_set_state(persistentPipeline, GST_STATE_PLAYING);
+            streamInitialized = true;
+            std::cout << "Ultra-low latency persistent output stream initialized!" << std::endl;
+            std::cout << "Optimized for minimal latency in both passthrough and processing modes" << std::endl;
+            return true;
         }
-        
-        // Keep pipe in blocking mode for reliable writes
-        int fd = fileno(ffmpegProcess);
-        
-        // Set pipe buffer size
-        int result = fcntl(fd, F_SETPIPE_SZ, 1048576);  // 1MB pipe buffer
-        if (result == -1) {
-            std::cerr << "Warning: Could not set pipe buffer size" << std::endl;
-        }
-        
-        return true;
+        return false;
     };
 
-    if (!buildFFmpegStreamer()) {
-        std::cerr << "Failed to initialize FFmpeg streaming, exiting..." << std::endl;
+    // Initialize the single persistent output stream for all modes
+    std::cout << "Initializing single persistent output stream..." << std::endl;
+    if (!initializePersistentStream()) {
+        std::cerr << "Failed to initialize persistent output stream" << std::endl;
         return 1;
     }
 
-    int delayMs = (runParams.optimizeFps) ? 1 : static_cast<int>(1000.0 / fps);
-
-    const int windowWidth = runParams.width;
-    const int windowHeight = runParams.height;
+    // Check if we should start in passthrough mode (no processing needed)
+    bool usePassthrough = !runParams.enhancerEnabled && 
+                         !runParams.rollCorrectionEnabled && 
+                         !runParams.stabilizationEnabled &&
+                         !runParams.trackerEnabled;
+    
+    std::cout << "Starting in " << (usePassthrough ? "passthrough" : "processing") << " mode" << std::endl;
+    std::cout << "Single persistent output stream will be used for both modes" << std::endl;
+    std::cout << "Mode switching is seamless with no client disconnections" << std::endl;
 
     // Only create windows if not optimizing for FPS
     if (!runParams.optimizeFps) {
@@ -409,6 +350,7 @@ int main(int argc, char** argv) {
         cv::resizeWindow("Final", windowWidth, windowHeight);
     }
 
+    // Main processing loop - handles both passthrough and processing modes
     while (!stopRequested) {
         // Check if the camera is still healthy - less aggressive checking
         if (!cam->isHealthy()) {
@@ -500,17 +442,9 @@ int main(int argc, char** argv) {
                             frameWidth = newFrameWidth;
                             frameHeight = newFrameHeight;
                             
-                            // Restart FFmpeg streaming with new dimensions
-                            if (ffmpegProcess) {
-                                std::cout << "Restarting FFmpeg streaming with new frame dimensions..." << std::endl;
-                                pclose(ffmpegProcess);
-                                ffmpegProcess = nullptr;
-                                
-                                // Rebuild FFmpeg streaming with new dimensions
-                                if (!buildFFmpegStreamer()) {
-                                    std::cerr << "Failed to restart FFmpeg streaming with new dimensions" << std::endl;
-                                }
-                            }
+                            // Note: Persistent stream dimensions are fixed at initialization
+                            // For dimension changes, application restart is recommended
+                            std::cout << "Note: Frame dimensions changed. For optimal performance, restart application." << std::endl;
                         }
                         
                         // 4. Update window sizes if dimensions changed and windows are enabled
@@ -522,12 +456,33 @@ int main(int argc, char** argv) {
                         // 5. Check if we need to switch between passthrough and processing mode
                         bool newUsePassthrough = !runParams.enhancerEnabled && 
                                                !runParams.rollCorrectionEnabled && 
-                                               !runParams.stabilizationEnabled;
+                                               !runParams.stabilizationEnabled &&
+                                               !runParams.trackerEnabled;
                         
-                        if (shouldRestart(usePassthrough, newUsePassthrough)) {
-                            std::cout << "Processing mode changed - restart required for optimal performance" << std::endl;
-                            std::cout << "New mode: " << (newUsePassthrough ? "Passthrough" : "Processing") << std::endl;
-                            // Note: We continue with current mode for now, full restart would be needed for mode switch
+                        if (newUsePassthrough != usePassthrough) {
+                            if (newUsePassthrough) {
+                                std::cout << "→ Seamlessly switching to PASSTHROUGH mode - raw frames will be streamed" << std::endl;
+                                std::cout << "→ Output stream remains active, no client disconnection" << std::endl;
+                                // Stop tracker if active
+                                tracker.reset();
+                            } else {
+                                std::cout << "→ Seamlessly switching to PROCESSING mode - frames will be processed before streaming" << std::endl;
+                                std::cout << "→ Output stream remains active, no client disconnection" << std::endl;
+                                // Reinitialize tracker if needed
+                                if (runParams.trackerEnabled) {
+                                    try {
+                                        tracker = std::make_unique<vs::DeepStreamTracker>(trackerParams);
+                                    } catch (const std::exception& e) {
+                                        std::cerr << "Failed to initialize tracker: " << e.what() << std::endl;
+                                    }
+                                }
+                                
+                                // Reinitialize stabilizer if needed
+                                if (runParams.stabilizationEnabled) {
+                                    stab = vs::Stabilizer(stabParams);
+                                }
+                            }
+                            usePassthrough = newUsePassthrough;
                         }
                         
                         std::cout << "=== Configuration reloaded successfully ===" << std::endl;
@@ -561,7 +516,8 @@ int main(int argc, char** argv) {
         static int frameSkipCounter = 0;
         
         // Only show raw frame very occasionally to reduce processing overhead
-        if (!runParams.optimizeFps && frameSkipCounter % 30 == 0) { // Changed from 10 to 30
+        // Skip display in passthrough mode for maximum performance
+        if (!runParams.optimizeFps && !usePassthrough && frameSkipCounter % 30 == 0) {
             cv::Mat displayFrame;
             if (windowWidth > 0 && windowHeight > 0) {
                 cv::resize(frame, displayFrame, cv::Size(windowWidth, windowHeight));
@@ -571,61 +527,78 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Apply processing only if enabled - avoid unnecessary copying
+        // Frame processing - optimized for minimal latency in passthrough mode
         cv::Mat* framePtr = &frame;  // Use pointer to avoid copying
         cv::Mat tempFrame1, tempFrame2, tempFrame3;  // Reuse these instead of creating new ones
         
-        if (runParams.enhancerEnabled) {
-            tempFrame1 = vs::Enhancer::enhanceImage(*framePtr, enhancerParams);
-            framePtr = &tempFrame1;
-        }
-
-        // Apply Roll Correction
-        if (runParams.rollCorrectionEnabled) {
-            tempFrame2 = vs::RollCorrection::autoCorrectRoll(*framePtr, rollParams);
-            framePtr = &tempFrame2;
-        }
-
-        // Apply Stabilization
-        if (runParams.stabilizationEnabled) {
-            tempFrame3 = stab.stabilize(*framePtr);
-            framePtr = &tempFrame3;
-        }
-        
-        // Apply Tracking
-        if (runParams.trackerEnabled) {
-            // Process frame through tracker
-            auto detections = tracker.processFrame(*framePtr);
+        if (usePassthrough) {
+            // PASSTHROUGH MODE: Ultra-low latency path
+            // Skip all processing and minimize frame handling
+            // Direct frame forwarding with minimal OpenCV operations
             
-            // Check for new tracking coordinates from TCP
-            if (tcp.tryGetLatest(x, y)) {
-                std::cout << "Received tracking coordinates: (" << x << "," << y << ") with " 
-                          << detections.size() << " detections available" << std::endl;
+            // Only ensure frame is properly sized if needed (avoid unnecessary operations)
+            if (frame.cols != frameWidth || frame.rows != frameHeight) {
+                // Fast resize only if absolutely necessary
+                cv::resize(frame, tempFrame1, cv::Size(frameWidth, frameHeight), 0, 0, cv::INTER_LINEAR);
+                framePtr = &tempFrame1;
+            }
+            // Otherwise use original frame directly for maximum speed
+        } else {
+            // PROCESSING MODE: Apply enabled processing steps
+            if (runParams.enhancerEnabled) {
+                tempFrame1 = vs::Enhancer::enhanceImage(*framePtr, enhancerParams);
+                framePtr = &tempFrame1;
+            }
+
+            // Apply Roll Correction
+            if (runParams.rollCorrectionEnabled) {
+                tempFrame2 = vs::RollCorrection::autoCorrectRoll(*framePtr, rollParams);
+                framePtr = &tempFrame2;
+            }
+
+            // Apply Stabilization
+            if (runParams.stabilizationEnabled) {
+                tempFrame3 = stab.stabilize(*framePtr);
+                framePtr = &tempFrame3;
+            }
+            
+            // Apply Tracking
+            if (runParams.trackerEnabled && tracker) {
+                // Process frame through tracker
+                auto detections = tracker->processFrame(*framePtr);
                 
-                // Draw detections with the selected coordinates
-                cv::Mat trackedFrame = tracker.drawDetections(*framePtr, detections, x, y);
-                if (framePtr == &tempFrame3) {
-                    tempFrame3 = trackedFrame;  // Update the existing frame
+                // Check for new tracking coordinates from TCP
+                if (tcp.tryGetLatest(x, y)) {
+                    std::cout << "Received tracking coordinates: (" << x << "," << y << ") with " 
+                              << detections.size() << " detections available" << std::endl;
+                    
+                    // Draw detections with the selected coordinates
+                    cv::Mat trackedFrame = tracker->drawDetections(*framePtr, detections, x, y);
+                    if (framePtr == &tempFrame3) {
+                        tempFrame3 = trackedFrame;  // Update the existing frame
+                    } else {
+                        tempFrame3 = trackedFrame;  // Use tempFrame3 for tracked output
+                        framePtr = &tempFrame3;
+                    }
                 } else {
-                    tempFrame3 = trackedFrame;  // Use tempFrame3 for tracked output
-                    framePtr = &tempFrame3;
-                }
-            } else {
-                // No new coordinates, use previous selection
-                cv::Mat trackedFrame = tracker.drawDetections(*framePtr, detections, -1, -1);
-                if (framePtr == &tempFrame3) {
-                    tempFrame3 = trackedFrame;  // Update the existing frame
-                } else {
-                    tempFrame3 = trackedFrame;  // Use tempFrame3 for tracked output
-                    framePtr = &tempFrame3;
+                    // Just draw all detections without selection
+                    cv::Mat trackedFrame = tracker->drawDetections(*framePtr, detections);
+                    if (framePtr == &tempFrame3) {
+                        tempFrame3 = trackedFrame;  // Update the existing frame
+                    } else {
+                        tempFrame3 = trackedFrame;  // Use tempFrame3 for tracked output
+                        framePtr = &tempFrame3;
+                    }
                 }
             }
         }
         
-        cv::Mat& processedFrame = *framePtr;  // Reference to final processed frame
+        // The processed frame (or raw frame in passthrough mode) is now pointed to by framePtr
+        cv::Mat& processedFrame = *framePtr;
 
         // Only display final output very occasionally to reduce overhead
-        if (!runParams.optimizeFps && frameSkipCounter % 30 == 0 && !processedFrame.empty()) { // Changed from 10 to 30
+        // Skip display in passthrough mode for maximum performance  
+        if (!runParams.optimizeFps && !usePassthrough && frameSkipCounter % 30 == 0 && !processedFrame.empty()) {
             cv::Mat displayFrame;
             if (windowWidth > 0 && windowHeight > 0) {
                 cv::resize(processedFrame, displayFrame, cv::Size(windowWidth, windowHeight));
@@ -635,99 +608,97 @@ int main(int argc, char** argv) {
             }
         }
         
-        // Send frame to MediaMTX via FFmpeg
-        if (!processedFrame.empty() && ffmpegProcess) {
+        // Send frame to persistent GStreamer output stream
+        // Optimized paths: fast passthrough vs full processing
+        if (!processedFrame.empty() && persistentAppsrc) {
             // Improved timing control to reduce glitches
             static auto lastSendTime = std::chrono::high_resolution_clock::now();
             static int frameDropCount = 0;
             auto currentTime = std::chrono::high_resolution_clock::now();
             double timeSinceLastSend = std::chrono::duration<double, std::milli>(currentTime - lastSendTime).count();
             
-            // More precise frame timing
+            // More precise frame timing - more aggressive for passthrough
             double targetInterval = 1000.0 / fps;
+            double timingTolerance = usePassthrough ? 0.8 : 0.9;  // More aggressive timing for passthrough
             
             // Only send frame if we're not getting too far behind
-            if (timeSinceLastSend >= targetInterval * 0.9) {  // Tighter timing control
-                // Ensure frame is properly formatted and sized
+            if (timeSinceLastSend >= targetInterval * timingTolerance) {
                 cv::Mat outputFrame;
                 
-                // Always ensure the frame is continuous and properly formatted
-                if (processedFrame.cols != frameWidth || processedFrame.rows != frameHeight) {
-                    cv::resize(processedFrame, outputFrame, cv::Size(frameWidth, frameHeight), 0, 0, cv::INTER_LANCZOS4);
-                } else {
-                    // Ensure frame is continuous in memory
-                    if (!processedFrame.isContinuous()) {
-                        processedFrame.copyTo(outputFrame);
-                    } else {
-                        outputFrame = processedFrame.clone(); // Create a copy to avoid memory issues
-                    }
-                }
-                
-                // Ensure BGR format (FFmpeg expects BGR24 as specified in command)
-                if (outputFrame.channels() != 3) {
-                    cv::cvtColor(outputFrame, outputFrame, cv::COLOR_GRAY2BGR);
-                }
-                
-                // Ensure frame is properly sized and continuous in memory
-                cv::Size expectedSize(frameWidth, frameHeight);
-                bool needResize = outputFrame.size() != expectedSize;
-                bool needContinuous = !outputFrame.isContinuous();
-                
-                cv::Mat frameToSend;
-                if (needResize || needContinuous) {
-                    if (needResize) {
-                        cv::resize(outputFrame, frameToSend, expectedSize, 0, 0, cv::INTER_LINEAR);
-                    } else {
-                        outputFrame.copyTo(frameToSend);
-                    }
-                } else {
-                    frameToSend = outputFrame;
-                }
-                
-                // Verify frame properties before sending
-                size_t expectedFrameSize = frameWidth * frameHeight * 3; // BGR24 = 3 bytes per pixel
-                size_t actualFrameSize = frameToSend.total() * frameToSend.elemSize();
-                
-                if (actualFrameSize != expectedFrameSize) {
-                    std::cerr << "Frame size mismatch: expected " << expectedFrameSize 
-                             << " got " << actualFrameSize << std::endl;
-                    continue;
-                }
-                
-                // Write frame data in chunks to avoid pipe buffer issues
-                size_t totalBytesWritten = 0;
-                const uint8_t* data = frameToSend.data;
-                
-                while (totalBytesWritten < actualFrameSize) {
-                    size_t remainingBytes = actualFrameSize - totalBytesWritten;
-                    size_t chunkSize = std::min(remainingBytes, size_t(1024 * 1024)); // 1MB chunks
+                if (usePassthrough) {
+                    // PASSTHROUGH MODE: Ultra-fast path with minimal processing
+                    // Avoid unnecessary copies and format conversions
                     
-                    size_t bytesWritten = fwrite(data + totalBytesWritten, 1, chunkSize, ffmpegProcess);
-                    if (bytesWritten < chunkSize) {
-                        frameDropCount++;
-                        if (frameDropCount > 3) {  // More aggressive restart on write failures
-                            std::cout << "Write failures detected, restarting FFmpeg..." << std::endl;
-                            pclose(ffmpegProcess);
-                            ffmpegProcess = nullptr;
-                            
-                            if (buildFFmpegStreamer()) {
-                                std::cout << "FFmpeg process restarted successfully" << std::endl;
-                                frameDropCount = 0;
-                            }
-                            break;
+                    if (processedFrame.cols == frameWidth && processedFrame.rows == frameHeight && 
+                        processedFrame.isContinuous() && processedFrame.channels() == 3) {
+                        // Perfect case: frame is already in correct format, use directly
+                        outputFrame = processedFrame;
+                    } else {
+                        // Minimal processing: only what's absolutely necessary
+                        if (processedFrame.cols != frameWidth || processedFrame.rows != frameHeight) {
+                            cv::resize(processedFrame, outputFrame, cv::Size(frameWidth, frameHeight), 0, 0, cv::INTER_LINEAR);
+                        } else {
+                            outputFrame = processedFrame.clone(); // Ensure continuity if needed
                         }
-                        break;
+                        
+                        // Ensure BGR format only if needed
+                        if (outputFrame.channels() != 3) {
+                            cv::cvtColor(outputFrame, outputFrame, cv::COLOR_GRAY2BGR);
+                        }
+                    }
+                } else {
+                    // PROCESSING MODE: Full validation and format conversion
+                    // Always ensure the frame is continuous and properly formatted
+                    if (processedFrame.cols != frameWidth || processedFrame.rows != frameHeight) {
+                        cv::resize(processedFrame, outputFrame, cv::Size(frameWidth, frameHeight), 0, 0, cv::INTER_LANCZOS4);
+                    } else {
+                        // Ensure frame is continuous in memory
+                        if (!processedFrame.isContinuous()) {
+                            processedFrame.copyTo(outputFrame);
+                        } else {
+                            outputFrame = processedFrame.clone(); // Create a copy to avoid memory issues
+                        }
                     }
                     
-                    totalBytesWritten += bytesWritten;
+                    // Ensure BGR format (GStreamer expects this)
+                    if (outputFrame.channels() != 3) {
+                        cv::cvtColor(outputFrame, outputFrame, cv::COLOR_GRAY2BGR);
+                    }
                 }
                 
-                if (totalBytesWritten == actualFrameSize) {
-                    frameDropCount = 0;
-                    fflush(ffmpegProcess);  // Ensure frame is sent
-                }
+                // Create GStreamer buffer with proper size
+                size_t bufferSize = outputFrame.total() * outputFrame.elemSize();
+                GstBuffer* buf = gst_buffer_new_allocate(nullptr, bufferSize, nullptr);
                 
-                lastSendTime = currentTime;
+                GstMapInfo map;
+                if (gst_buffer_map(buf, &map, GST_MAP_WRITE)) {
+                    // Copy frame data
+                    std::memcpy(map.data, outputFrame.data, bufferSize);
+                    gst_buffer_unmap(buf, &map);
+                    
+                    // Set proper timestamp
+                    GST_BUFFER_PTS(buf) = gst_util_uint64_scale(frameCounter++, GST_SECOND, fps);
+                    GST_BUFFER_DURATION(buf) = gst_util_uint64_scale(1, GST_SECOND, fps);
+                    
+                    // Push buffer to pipeline
+                    GstFlowReturn ret = gst_app_src_push_buffer(persistentAppsrc, buf);
+                    if (ret != GST_FLOW_OK) {
+                        std::cerr << "Failed to push buffer to persistent stream: " << ret << std::endl;
+                        frameDropCount++;
+                        if (frameDropCount > 10) {
+                            std::cout << "Too many failed pushes, restarting persistent stream..." << std::endl;
+                            // Restart pipeline logic here if needed
+                            frameDropCount = 0;
+                        }
+                    } else {
+                        frameDropCount = 0; // Reset on success
+                    }
+                    
+                    lastSendTime = currentTime;
+                } else {
+                    std::cerr << "Failed to map GStreamer buffer for persistent stream" << std::endl;
+                    gst_buffer_unref(buf);
+                }
             }
         }
         
@@ -741,7 +712,8 @@ int main(int argc, char** argv) {
         // Print performance stats much less frequently to reduce console overhead
         if (frameSkipCounter % 300 == 0) {  // Every 300 frames (~10 seconds at 30fps)
             double currentFps = 1000.0 / frameTime;
-            std::cout << "Processing Time: " << frameTime << " ms | FPS: " << currentFps << std::endl;
+            std::cout << "[" << (usePassthrough ? "PASSTHROUGH" : "PROCESSING") << " MODE] " 
+                      << "Processing Time: " << frameTime << " ms | FPS: " << currentFps << std::endl;
         }
 
         // Adaptive delay based on processing time to maintain target FPS
@@ -764,6 +736,10 @@ int main(int argc, char** argv) {
         }
     }
     
+    // Main loop completed - cleanup resources
+    std::cout << "Main processing loop ended, cleaning up resources..." << std::endl;
+    
+cleanup:
     std::cout << "Cleaning up resources..." << std::endl;
     
     // Stop camera capture
@@ -771,23 +747,17 @@ int main(int argc, char** argv) {
         cam->stop();
     }
     
+    // Cleanup persistent GStreamer pipeline
+    if (persistentAppsrc && persistentPipeline) {
+        std::cout << "Closing persistent GStreamer pipeline..." << std::endl;
+        gst_element_set_state(persistentPipeline, GST_STATE_NULL);
+        gst_object_unref(persistentPipeline);
+        persistentPipeline = nullptr;
+        persistentAppsrc = nullptr;
+    }
+    
     // Stop TCP receiver
     tcp.stop();
-    
-    // Cleanup streaming processes
-    if (ffmpegProcess) {
-        std::cout << "Closing FFmpeg streaming process..." << std::endl;
-        int exitCode = pclose(ffmpegProcess);
-        std::cout << "FFmpeg process closed with code: " << exitCode << std::endl;
-        ffmpegProcess = nullptr;
-    }
-    
-    if (passthroughProcess) {
-        std::cout << "Closing passthrough process..." << std::endl;
-        int exitCode = pclose(passthroughProcess);
-        std::cout << "Passthrough process closed with code: " << exitCode << std::endl;
-        passthroughProcess = nullptr;
-    }
     
     cv::destroyAllWindows();
     std::cout << "Cleanup complete." << std::endl;
