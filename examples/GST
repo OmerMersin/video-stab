@@ -1,0 +1,20 @@
+pipeline_create restream rtspsrc name=src location=rtsp://192.168.144.119:554 latency=0 ! rtph265depay ! h265parse ! rtspclientsink location=rtsp://127.0.0.1:8554/forwarded
+
+
+
+pipeline_create source_pipeline rtspsrc name=src location=rtsp://192.168.144.119:554 latency=1000 !  rtph265depay ! h265parse ! interpipesink name=to_output sync=false async=false
+pipeline_play source_pipeline
+pipeline_create output_pipeline interpipesrc name=from_input listen-to=to_output is-live=true do-timestamp=true ! rtspclientsink location=rtsp://192.168.144.150:8554/forwarded
+pipeline_play output_pipeline
+
+pipeline_delete source_pipeline
+pipeline_delete output_pipeline
+
+pipeline_stop source_pipeline
+pipeline_stop output_pipeline
+
+./test-launch "( \
+   rtspsrc location=rtsp://192.168.144.119:554 latency=0 ! \
+   rtph265depay ! h265parse ! \
+   rtph265pay name=pay0 pt=96 config-interval=1 \
+)"
