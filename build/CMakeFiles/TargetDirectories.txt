@@ -1,7 +1,0 @@
-/home/orin/Developer/libtracker/build/CMakeFiles/video-stab.dir
-/home/orin/Developer/libtracker/build/CMakeFiles/edit_cache.dir
-/home/orin/Developer/libtracker/build/CMakeFiles/rebuild_cache.dir
-/home/orin/Developer/libtracker/build/CMakeFiles/list_install_components.dir
-/home/orin/Developer/libtracker/build/CMakeFiles/install.dir
-/home/orin/Developer/libtracker/build/CMakeFiles/install/local.dir
-/home/orin/Developer/libtracker/build/CMakeFiles/install/strip.dir
