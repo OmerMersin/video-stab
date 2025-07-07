@@ -16,3 +16,4 @@
 *.exe
 *.out
 *.log
+/build/
