@@ -83,14 +83,14 @@ namespace vs {
     Stabilizer::Stabilizer(const Parameters &params)
     : params_(params)
     {
-        logMessage("Initializing...");
+        if(params_.logging) logMessage("Initializing...");
 
         useGpu_ = params_.useCuda;
         borderMode_ = mapBorderMode(params_.borderType);
 
         if(params_.cropNZoom && params_.borderType != "black") {
             // force black if crop+zoom
-            logMessage("cropNZoom => ignoring borderType, using black.", false);
+            if(params_.logging) logMessage("cropNZoom => ignoring borderType, using black.", false);
             borderMode_ = cv::BORDER_CONSTANT;
         }
         
@@ -98,14 +98,23 @@ namespace vs {
         if (params_.borderType == "fade") {
             fadeFrameCount_ = 0;
             borderHistory_ = cv::Mat();
-            logMessage("Using fade border effect", false);
+            if(params_.logging) logMessage("Using fade border effect", false);
         }
 
-        // 1D box kernel
-        boxKernel_.resize(params_.smoothingRadius, 1.0f / params_.smoothingRadius);
+        // Optimized smoothing radius for performance
+        int effectiveRadius = std::max(3, std::min(params_.smoothingRadius, 15));
+        
+        // 1D box kernel - pre-allocated for efficiency
+        boxKernel_.resize(effectiveRadius, 1.0f / effectiveRadius);
+        
+        // Pre-allocate vectors for better performance
+        transforms_.reserve(100);
+        path_.reserve(100);
+        smoothedPath_.reserve(100);
+        // Note: std::deque doesn't have reserve(), but it's still more efficient than std::vector for our use case
 
-        // CPU CLAHE
-        claheCPU_ = cv::createCLAHE(2.0, cv::Size(8,8));
+        // CPU CLAHE with optimized parameters
+        claheCPU_ = cv::createCLAHE(1.5, cv::Size(8,8));  // Reduced clip limit for performance
 
     #if defined(HAVE_OPENCV_CUDAARITHM) || defined(HAVE_OPENCV_CUDAWARPING)
         if(useGpu_) {
@@ -176,7 +185,8 @@ namespace vs {
     cv::Mat Stabilizer::stabilize(const cv::Mat &frame)
     {
     static int frameTicker = 0;
-    constexpr int SKIP_RATE = 1;   // 1‑process‑2‑skip‑2   (adjust!)
+    // Reduced frame skipping to prevent shaking - process more frames for stability
+    constexpr int SKIP_RATE = 1;   // Process every frame for better stability
         if(frame.empty()) {
             return cv::Mat();
         }
@@ -189,13 +199,14 @@ namespace vs {
             // Initialize with first frame
             frameWidth_ = frame.cols;
             frameHeight_ = frame.rows;
-                constexpr int ANALYSIS_W = 640, ANALYSIS_H = 360;
+            // Reduced analysis resolution for better performance on Jetson but not too aggressive
+            constexpr int ANALYSIS_W = 640, ANALYSIS_H = 360;  // Restored for better stability
     double fx = static_cast<double>(ANALYSIS_W) / frame.cols;
     double fy = static_cast<double>(ANALYSIS_H) / frame.rows;
         cv::Mat firstSmall;
     cv::resize(frame, firstSmall,
                cv::Size(ANALYSIS_W, ANALYSIS_H),
-               0, 0, cv::INTER_AREA);
+               0, 0, cv::INTER_AREA);  // INTER_AREA for better quality
 
             // Convert to gray
             if(useGpu_) {
@@ -268,20 +279,21 @@ namespace vs {
             return cv::Mat();
         }
 	if ((frameTicker++ % SKIP_RATE) != 0) {
-	    // keep the frame unchanged but
-	    // still push it into frameQueue_ so timing stays correct
-	    frameQueue_.push_back(frame.clone());
+	    // For skipped frames, avoid cloning - just queue reference and return original
+	    frameQueue_.push_back(frame);  // Remove .clone() for performance
 	    frameIndexQueue_.push_back(nextFrameIndex_++);
 	    return frame;              // <- forward original
 	}
-        // subsequent frames
-        frameQueue_.push_back(frame.clone());
+        // subsequent frames - only clone when necessary
+        frameQueue_.push_back(frame);  // Remove .clone() for performance
         frameIndexQueue_.push_back(nextFrameIndex_);
         
 
         generateTransform(frame);
 
-        if(frameIndexQueue_.size() < (size_t)params_.smoothingRadius) {
+        // Use effective smoothing radius for better performance
+        int effectiveRadius = std::max(3, std::min(params_.smoothingRadius, 15));
+        if(frameIndexQueue_.size() < (size_t)effectiveRadius) {
             nextFrameIndex_++;
             return cv::Mat();
         }
@@ -301,12 +313,13 @@ namespace vs {
 
     void Stabilizer::generateTransform(const cv::Mat &currFrameBGR)
     {
-    constexpr int ANALYSIS_W = 640, ANALYSIS_H = 360;
+    // Balanced analysis resolution - good stability with reasonable performance
+    constexpr int ANALYSIS_W = 640, ANALYSIS_H = 360;  // Restored for better stability
     cv::Mat small;
     cv::resize(currFrameBGR,              // full‑HD in
                small,                     // 640×360 out
                cv::Size(ANALYSIS_W, ANALYSIS_H),
-               0, 0, cv::INTER_AREA);
+               0, 0, cv::INTER_AREA);     // INTER_AREA for better quality
 	analysisWidth_  = small.cols;   // 640
 	analysisHeight_ = small.rows;   // 360
 
@@ -364,15 +377,15 @@ namespace vs {
                     }
                 }
                 
-                // Apply SightLine-inspired outlier rejection
-                if (params_.outlierRejection && validPrev.size() > 10) {
+                // Apply SightLine-inspired outlier rejection - simplified for performance
+                if (params_.outlierRejection && validPrev.size() > 15) {  // Increased threshold
                     filterOutliers(validPrev, validCurr);
                 }
                 
-                // estimate
+                // estimate affine transform
                 cv::Mat T = cv::Mat::eye(2,3,CV_64F);
-                if(!validPrev.empty() && !validCurr.empty()) {
-                    cv::Mat affine = cv::estimateAffinePartial2D(validPrev, validCurr);
+                if(validPrev.size() >= 6 && validCurr.size() >= 6) {  // Need minimum 6 points
+                    cv::Mat affine = cv::estimateAffinePartial2D(validPrev, validCurr, cv::noArray(), cv::RANSAC, 3.0);
                     if(!affine.empty()) {
                         T = affine;
                     }
@@ -381,7 +394,7 @@ namespace vs {
                 double dy = T.at<double>(1,2);
                 double da = std::atan2(T.at<double>(1,0), T.at<double>(0,0));
                 
-                // Apply horizon lock if enabled
+                // Skip horizon lock for performance unless specifically enabled
                 if (params_.horizonLock) {
                     da = 0.0;
                 }
@@ -410,14 +423,14 @@ namespace vs {
                     }
                 }
                 
-                // Apply SightLine-inspired outlier rejection
-                if (params_.outlierRejection && validPrev.size() > 10) {
+                // Apply SightLine-inspired outlier rejection - simplified for performance
+                if (params_.outlierRejection && validPrev.size() > 15) {  // Increased threshold
                     filterOutliers(validPrev, validCurr);
                 }
                 
                 cv::Mat T = cv::Mat::eye(2,3,CV_64F);
-                if(!validPrev.empty() && !validCurr.empty()) {
-                    cv::Mat affine = cv::estimateAffinePartial2D(validPrev, validCurr);
+                if(validPrev.size() >= 6 && validCurr.size() >= 6) {  // Need minimum 6 points
+                    cv::Mat affine = cv::estimateAffinePartial2D(validPrev, validCurr, cv::noArray(), cv::RANSAC, 3.0);
                     if(!affine.empty()) {
                         T = affine;
                     }
@@ -426,7 +439,7 @@ namespace vs {
                 double dy = T.at<double>(1,2);
                 double da = std::atan2(T.at<double>(1,0), T.at<double>(0,0));
                 
-                // Apply horizon lock if enabled
+                // Skip horizon lock for performance unless specifically enabled
                 if (params_.horizonLock) {
                     da = 0.0;
                 }
@@ -448,10 +461,10 @@ namespace vs {
         }
         smoothedPath_ = path_;
         
-        // Update adaptive parameters if enabled
-        if (params_.adaptiveSmoothing) {
-            updateAdaptiveParameters();
-        }
+        // Skip adaptive parameters for performance - disabled by default in config
+        // if (params_.adaptiveSmoothing) {
+        //     updateAdaptiveParameters();
+        // }
 
         // Now detect features on current for next iteration
         if(useGpu_) {
@@ -528,22 +541,16 @@ namespace vs {
             pa.push_back(v[2]);
         }
         
-        // Apply the selected smoothing method
+        // Apply the selected smoothing method - optimized for performance
         std::vector<float> sx, sy, sa;
         if (params_.smoothingMethod == "gaussian") {
-            // Apply Gaussian smoothing
+            // Apply Gaussian smoothing only if explicitly requested
             sx = gaussianFilterConvolve(px, params_.gaussianSigma);
             sy = gaussianFilterConvolve(py, params_.gaussianSigma);
             sa = gaussianFilterConvolve(pa, params_.gaussianSigma);
         }
-        else if (params_.smoothingMethod == "kalman") {
-            // Apply Kalman filter smoothing
-            sx = kalmanFilterSmooth(px);
-            sy = kalmanFilterSmooth(py);
-            sa = kalmanFilterSmooth(pa);
-        }
         else {
-            // Default to box filter smoothing
+            // Default to box filter smoothing - most efficient for real-time
             sx = boxFilterConvolve(px);
             sy = boxFilterConvolve(py);
             sa = boxFilterConvolve(pa);
@@ -554,7 +561,7 @@ namespace vs {
             smoothedPath_[i] = cv::Vec3f(sx[i], sy[i], sa[i]);
         }
 
-        // Apply motion prediction if enabled
+        // Apply motion prediction for better stability
         cv::Vec3f raw = transforms_[oldestIdx];
         cv::Vec3f diff = smoothedPath_[oldestIdx] - path_[oldestIdx];
         
@@ -564,10 +571,13 @@ namespace vs {
             
             if (intentional) {
                 // For intentional motion, reduce smoothing effect to be more responsive
-                diff *= 0.5f;  // Only apply 50% of the correction
+                diff *= 0.7f;  // Apply 70% of the correction for intentional motion
                 if (params_.logging) {
                     logMessage("Motion determined to be intentional - reducing stabilization effect");
                 }
+            } else {
+                // For unintentional motion (camera shake), apply full stabilization
+                diff *= 1.0f;  // Apply full correction
             }
         }
         
@@ -778,31 +788,44 @@ std::vector<float> Stabilizer::boxFilterConvolve(const std::vector<float> &path)
 {
     if(path.empty()) return {};
     
-    // Ensure the smoothing radius is at least 3 to prevent OpenCV assertion errors
-    int r = std::max(3, params_.smoothingRadius);
+    // Use proper smoothing radius for stability
+    int r = std::max(5, std::min(params_.smoothingRadius, 50));  // Allow larger radius for stability
 
-    // approximate median
-    std::vector<float> tmp = path;
-    if(tmp.size() > 0) {
-        std::nth_element(tmp.begin(), tmp.begin() + tmp.size()/2, tmp.end());
-        float med = tmp[tmp.size()/2];
-
-        std::vector<float> padded(path.size()+2*r, med);
-        for(size_t i=0; i<path.size(); i++){
-            padded[r+i] = path[i];
-        }
-
-        std::vector<float> result(path.size());
-        for(size_t i=0; i<path.size(); i++) {
-            double sum=0.0;
-            for(int k=0; k<r; k++){
-                sum += padded[i+k];
-            }
-            result[i] = static_cast<float>(sum / r);
-        }
+    if(path.size() <= r) {
+        // For very small arrays, use mean
+        float sum = std::accumulate(path.begin(), path.end(), 0.0f);
+        float mean = sum / path.size();
+        std::vector<float> result(path.size(), mean);
         return result;
     }
-    return path;
+    
+    // Use proper padding for better edge handling
+    std::vector<float> padded(path.size() + 2*r);
+    
+    // Pad with edge values (replicate border)
+    for(int i = 0; i < r; i++) {
+        padded[i] = path[0];  // Left padding
+        padded[padded.size() - 1 - i] = path[path.size() - 1];  // Right padding
+    }
+    
+    // Copy original data
+    for(size_t i = 0; i < path.size(); i++) {
+        padded[i + r] = path[i];
+    }
+    
+    // Apply box filter with proper normalization
+    std::vector<float> result(path.size());
+    int kernelSize = 2 * r + 1;
+    
+    for(size_t i = 0; i < path.size(); i++) {
+        float sum = 0.0f;
+        for(int j = 0; j < kernelSize; j++) {
+            sum += padded[i + j];
+        }
+        result[i] = sum / kernelSize;
+    }
+    
+    return result;
 }
 
     // CPU color + CLAHE

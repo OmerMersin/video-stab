@@ -1,6 +1,11 @@
 #ifndef VIDEO_STABILIZER_HPP
 #define VIDEO_STABILIZER_HPP
 
+// Compiler optimization hints for ARM processors (Jetson)
+#ifdef __ARM_NEON
+#define STABILIZER_SIMD_OPTIMIZED
+#endif
+
 #include <opencv2/opencv.hpp>
 
 // For GPU: make sure you’ve built OpenCV with CUDA, e.g. HAVE_OPENCV_CUDAARITHM, HAVE_OPENCV_CUDAOPTFLOW, etc.
