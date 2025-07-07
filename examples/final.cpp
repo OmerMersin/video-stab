@@ -348,7 +348,7 @@ int main(int argc, char** argv) {
     if (bitrate > 8000) bitrate = 8000; // Maximum bitrate ceiling
     
     auto buildFFmpegStreamer = [&]() -> bool {
-        // Build FFmpeg command for processing mode
+        // Build FFmpeg command for processing mode - optimized for Jetson Orin Nano
         std::stringstream ffmpegCmd;
         ffmpegCmd << "ffmpeg -loglevel warning "
                   << "-f rawvideo -pix_fmt bgr24 "
@@ -357,16 +357,16 @@ int main(int argc, char** argv) {
                   << "-probesize 32 -analyzeduration 0 "  // Minimize startup delay
                   << "-thread_queue_size 512 "  // Increase queue size for stability
                   << "-i - "  // Read from stdin
-                  << "-c:v libx264 -preset ultrafast "  // Use ultrafast for minimal latency
+                  << "-c:v libx264 -preset veryfast "  // Back to x264 with veryfast preset for low latency
                   << "-tune zerolatency "
-                  << "-profile:v baseline "  // Use baseline profile for better compatibility
+                  << "-profile:v main "  // Use main profile for better compatibility
                   << "-x264opts "
-                  << "no-scenecut:sliced-threads=1:sync-lookahead=0:rc-lookahead=0:mbtree=0 "
-                  << "-crf 23 "
+                  << "no-scenecut:sliced-threads=1:sync-lookahead=0:rc-lookahead=0:mbtree=0:bframes=0:weightp=0 "
+                  << "-crf 25 "  // Optimized CRF for good quality/performance balance
                   << "-maxrate " << bitrate << "k "
-                  << "-bufsize " << (bitrate * 2) << "k "
+                  << "-bufsize " << bitrate << "k "  // Reduced buffer size for lower latency
                   << "-pix_fmt yuv420p "
-                  << "-g " << static_cast<int>(fps) << " "  // GOP size = fps for frequent keyframes
+                  << "-g " << static_cast<int>(fps / 2) << " "  // Keyframe every 0.5 seconds for better seeking
                   << "-f rtsp -rtsp_transport tcp "
                   << "rtsp://localhost:8554/forwarded";
         
