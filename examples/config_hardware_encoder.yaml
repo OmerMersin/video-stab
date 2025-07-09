@@ -1,0 +1,52 @@
+# Hardware Encoder Optimized Configuration
+# This configuration uses the optimized pipeline with low-level NVIDIA hardware encoding
+
+video_source: "rtsp://192.168.144.119:554"
+
+mode:
+  width: 1920
+  height: 1080
+  optimize_fps: true
+  use_cuda: true
+  
+  # Processing features (when enabled, switches to hardware encoder)
+  enhancer_enabled: false
+  roll_correction_enabled: false
+  stabilization_enabled: false
+  tracker_enabled: false
+
+enhancer:
+  enabled: false
+  clahe_enabled: false
+  denoise_enabled: false
+  sharpen_enabled: false
+  gamma_correction: 1.0
+  brightness_adjustment: 0.0
+  contrast_adjustment: 1.0
+
+roll_correction:
+  enabled: false
+  max_angle: 45.0
+  confidence_threshold: 0.3
+
+stabilizer:
+  enabled: false
+  smoothing_radius: 30
+  max_angle: 30.0
+  max_translation: 50.0
+  crop_ratio: 0.1
+
+camera:
+  buffer_size: 4
+  fps: 30
+  codec: "h265"
+  width: 1920
+  height: 1080
+
+deepstream_tracker:
+  enabled: false
+  model_engine: "/opt/nvidia/deepstream/deepstream-7.1/samples/models/Primary_Detector/resnet18_trafficcamnet.etlt_b8_gpu0_int8.engine"
+  model_config_file: "/opt/nvidia/deepstream/deepstream-7.1/samples/configs/deepstream-app/config_infer_primary_resnet18.txt"
+  processing_width: 640
+  processing_height: 368
+  confidence_threshold: 0.3
