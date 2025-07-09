@@ -1,0 +1,90 @@
+# CMakeLists.txt for hardware encoder example
+cmake_minimum_required(VERSION 3.10)
+project(hardware_encoder_example)
+
+# Set C++ standard
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Find packages
+find_package(PkgConfig REQUIRED)
+find_package(OpenCV REQUIRED)
+
+# Find GStreamer
+pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0)
+pkg_check_modules(GSTREAMER_APP REQUIRED gstreamer-app-1.0)
+
+# Jetson Multimedia API paths
+set(JETSON_MULTIMEDIA_API_PATH "/usr/src/jetson_multimedia_api")
+set(JETSON_MULTIMEDIA_SAMPLES_PATH "${JETSON_MULTIMEDIA_API_PATH}/samples")
+set(JETSON_MULTIMEDIA_INCLUDE_PATH "${JETSON_MULTIMEDIA_API_PATH}/include")
+
+# Include directories
+include_directories(
+    ${OpenCV_INCLUDE_DIRS}
+    ${GSTREAMER_INCLUDE_DIRS}
+    ${GSTREAMER_APP_INCLUDE_DIRS}
+    ${JETSON_MULTIMEDIA_INCLUDE_PATH}
+    ${JETSON_MULTIMEDIA_SAMPLES_PATH}/common/classes
+    ${JETSON_MULTIMEDIA_SAMPLES_PATH}/common/algorithm/trt
+    ../include
+    /usr/include/libdrm
+    /usr/include/EGL
+    /usr/include/GLES2
+)
+
+# Compile definitions
+add_definitions(-DUSE_NVBUF_TRANSFORM_API)
+
+# Source files
+set(SOURCES
+    main-gstd-jetson.cpp
+    ../src/RollCorrection.cpp
+    ../src/CamCap.cpp
+    ../src/AutoZoomCrop.cpp
+    ../src/Stabilizer.cpp
+    ../src/Enhancer.cpp
+    ../src/RTSPServer.cpp
+    ../src/DeepStreamTracker.cpp
+    ../src/TcpReciever.cpp
+    ../src/stabilizer_cuda.cu
+)
+
+# Create executable
+add_executable(hardware_encoder_example ${SOURCES})
+
+# Link libraries
+target_link_libraries(hardware_encoder_example
+    ${OpenCV_LIBS}
+    ${GSTREAMER_LIBRARIES}
+    ${GSTREAMER_APP_LIBRARIES}
+    nvv4l2
+    nvbufsurface
+    nvbufsurftransform
+    nvjpeg
+    EGL
+    GLESv2
+    X11
+    pthread
+    dl
+    rt
+    cuda
+    cudart
+    cublas
+    curand
+    cufft
+    nppig
+    npps
+    tracker
+    video-stab
+)
+
+# Compiler flags
+target_compile_options(hardware_encoder_example PRIVATE
+    ${GSTREAMER_CFLAGS_OTHER}
+    ${GSTREAMER_APP_CFLAGS_OTHER}
+    -Wall
+    -Wextra
+    -O3
+    -DWITH_GSTREAMER
+)

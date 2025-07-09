@@ -1,2 +1,0 @@
-/usr/bin/ar qc libvideo-stab.a CMakeFiles/video-stab.dir/src/Stabilizer.cpp.o CMakeFiles/video-stab.dir/src/CamCap.cpp.o CMakeFiles/video-stab.dir/src/RollCorrection.cpp.o CMakeFiles/video-stab.dir/src/AutoZoomCrop.cpp.o CMakeFiles/video-stab.dir/src/Enhancer.cpp.o CMakeFiles/video-stab.dir/src/RTSPServer.cpp.o CMakeFiles/video-stab.dir/src/DeepStreamTracker.cpp.o
-/usr/bin/ranlib libvideo-stab.a

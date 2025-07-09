@@ -7,7 +7,7 @@ mode:
   optimize_fps:  1
   use_cuda:  1
   tracker_enabled: 0
-  enhancer_enabled:              0
+  enhancer_enabled:              1
   roll_correction_enabled:              0
   stabilizer_enabled:              0
 
@@ -60,51 +60,51 @@ roll_correction:
   angle_filter_max:  70.0
 
 stabilizer:
-  # Basic parameters
-  smoothing_radius: 0
-  border_type: "replicate"
-  fadeDuration: 30      # Number of frames over which to apply the fade effect
-  fadeAlpha: 0.9        # Rate of decay for the fade effect (0-1)
-  border_size: 10
+  # Basic parameters - optimized for stability with good performance
+  smoothing_radius: 5        # Increased back for better stability
+  border_type: "replicate"    # Most efficient border type
+  fadeDuration: 30
+  fadeAlpha: 0.9
+  border_size: 10             # Increased for better stability
   crop_n_zoom: 0
-  logging: true
+  logging: false              # Disable logging for performance
   use_cuda: true
-  max_corners: 300
-  quality_level: 0.05
-  min_distance: 25.0
+  max_corners: 200            # Increased for better stability
+  quality_level: 0.05         # Reduced for more features
+  min_distance: 25.0          # Reduced for better feature distribution
   block_size: 3
   
-  # SightLine-inspired parameters
-  smoothing_method: "gaussian"  # Options: "box", "gaussian", "kalman"
-  gaussian_sigma: 15.0
+  # SightLine-inspired parameters - balanced for stability
+  smoothing_method: "gaussian" # Changed back to gaussian for better stability
+  gaussian_sigma: 20.0        # Increased for more smoothing
   
-  # Adaptive smoothing
-  adaptive_smoothing: 1
-  min_smoothing_radius: 10
-  max_smoothing_radius: 50
+  # Adaptive smoothing - enabled for better stability
+  adaptive_smoothing: 1       # Re-enabled for better stability
+  min_smoothing_radius: 15    # Increased minimum
+  max_smoothing_radius: 35    # Increased maximum
   
-  # Outlier rejection
+  # Outlier rejection - enabled for stability
   outlier_rejection: true
-  outlier_threshold: 3.0
+  outlier_threshold: 2.0      # Reduced for more aggressive filtering
   
-  # Motion prediction
-  motion_prediction: 1
-  intentional_motion_threshold: 0.8
+  # Motion prediction - enabled for smoother motion
+  motion_prediction: 1        # Re-enabled for better stability
+  intentional_motion_threshold: 0.9  # Increased threshold
   
-  # Region of Interest
+  # Region of Interest - optimized for stability
   use_roi: true
-  roi_x: 96       # Reduced from 320 to capture more of the left side
-  roi_y: 54       # Reduced from 180 to capture more of the top
-  roi_width: 1728 # Increased from 640 to cover 90% of frame width (1920*0.9)
-  roi_height: 972 # Increased from 360 to cover 90% of frame height (1080*0.9)
+  roi_x: 96       # Centered better
+  roi_y: 54       # Centered better
+  roi_width: 1728 # Full width for better tracking
+  roi_height: 972 # Full height for better tracking
   
-  # Horizon lock
-  horizon_lock: true
+  # Horizon lock - enabled for stability
+  horizon_lock: true          # Re-enabled for better stability
   
-  # Feature detector (0=GFTT, 1=ORB, 2=FAST, 3=BRISK)
-  feature_detector_type: 1
-  fast_threshold: 20
-  orb_features: 2000
+  # Feature detector - optimized for stability
+  feature_detector_type: 0    # GFTT is most stable
+  fast_threshold: 20          # Reduced for more features
+  orb_features: 1500          # Increased for better tracking
 
 
 
