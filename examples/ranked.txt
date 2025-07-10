@@ -1,7 +1,7 @@
 name		passthrough latency	process latency	pass during runtime
 final  		zero     		mid-glitch  		no
 final best	<10ms			low-glitchy		one way
-final copy	mid-glitchy		mid-glitchy		yes-switch after latency
+*final copy	mid-glitchy		mid-glitchy		yes-switch after latency (start in process)
 main-ffmpeg	mid-glitchy		mid-glitchy		one way-switch after latency
 main-gst	<10ms			low-gltichy		yes
 main-gstd	-			high-glitchy		no
