@@ -26,6 +26,7 @@ namespace vs {
             bool streamMode = false;   ///< (Optional) If you plan to handle special streaming logic
             int backend = 0;           ///< cv::VideoCapture API backend, e.g. cv::CAP_FFMPEG, etc.
             std::string colorspace;    ///< e.g. "BGR2GRAY", "BGR2HSV", "BGR2YUV", etc.
+            std::string codec = "h265"; ///< "h264" or "h265"
             bool logging = false;      ///< Enable/disable logging output
             int timeDelay = 0;         ///< Delay in seconds before reading frames (camera warm-up)
             bool threadedQueueMode = true; ///< If true, a separate thread pushes frames into a queue
