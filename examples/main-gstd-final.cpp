@@ -144,7 +144,7 @@ public:
         }
         
         // Create PROCESSING pipeline (OpenCV frame processing with software encoding)
-        std::string processingPipelineStr f= 
+        std::string processingPipelineStr = 
             "appsrc name=src is-live=true format=time block=false max-latency=0 "
             "caps=video/x-raw,format=BGR,width=" + std::to_string(frameWidth) +
             ",height=" + std::to_string(frameHeight) +

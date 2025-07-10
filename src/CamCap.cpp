@@ -33,29 +33,39 @@ namespace vs {
             int camIndex = std::stoi(params.source);
             cap.open(camIndex, params.backend);
         } 
-        else if (params.source.rfind("rtsp", 0) == 0) {  // Check if source starts with "rtsp"
-            if (params.logging) {
-                std::cout << "[CamCap] RTSP stream detected! Using ultra-low-latency GStreamer pipeline." << std::endl;
+        else if (params.source.rfind("rtsp", 0) == 0) {
+            if(params.logging) {
+                std::cout << "[CamCap] RTSP stream detected! Using ultra-low-latency GStreamer pipeline with " << params.codec << " codec." << std::endl;
             }
-
-            // Ultra-low-latency RTSP pipeline optimized for real-time processing
-        std::string gst_pipeline =
-            "rtspsrc location=" + params.source +
-            " protocols=udp latency=20 drop-on-latency=true buffer-mode=none "
-            "timeout=5000000 retry=3 retry-delay=2000000 "
-            "!"  // hand off to depay/parse/decode
-            "rtph265depay ! h265parse ! nvv4l2decoder drop-frame-interval=0 ! "
-            "nvvidconv interpolation-method=1 ! video/x-raw,format=BGRx ! "
-            "videoconvert ! video/x-raw,format=BGR ! "
-            "appsink drop=true max-buffers=1 sync=false";
-
+            std::string depay, parse;
+            if (params.codec == "h264") {
+                depay = "rtph264depay";
+                parse = "h264parse";
+            } else { // default to h265
+                depay = "rtph265depay";
+                parse = "h265parse";
+            }
+            // Removed invalid 'retry-delay' property from rtspsrc
+            std::string gst_pipeline = "rtspsrc location=" + params.source + " latency=0 ! " +
+                                       depay + " ! " + parse + " ! nvv4l2decoder ! nvvidconv ! video/x-raw,format=BGRx ! "
+                                       "videoconvert ! video/x-raw,format=BGR ! appsink drop=1";
             cap.open(gst_pipeline, cv::CAP_GSTREAMER);
         }
         else if (params.source.find(".mp4") != std::string::npos)  // local file
 	{
+        if (params.logging) {
+            std::cout << "[CamCap] MP4 file detected! Using GStreamer pipeline with " << params.codec << " codec." << std::endl;
+        }
+        std::string parser_pipeline;
+        if (params.codec == "h264") {
+            parser_pipeline = "h264parse";
+        } else { // default to h265
+            parser_pipeline = "h265parse";
+        }
+
 	    std::string gst_pipeline =
 		"filesrc location=" + params.source +
-		" ! qtdemux ! h264parse ! nvv4l2decoder ! "
+		" ! qtdemux ! " + parser_pipeline + " ! nvv4l2decoder ! "
 		"nvvidconv ! video/x-raw,format=BGRx ! "
 		"videoconvert ! video/x-raw,format=BGR ! appsink";
 
@@ -168,10 +178,16 @@ namespace vs {
                     if(!terminate) {
                         // Reopen the stream
                         if (params.source.rfind("rtsp", 0) == 0) {
+                            std::string decoder_pipeline;
+                            if (params.codec == "h264") {
+                                decoder_pipeline = "rtph264depay ! h264parse ! nvv4l2decoder drop-frame-interval=0 ! ";
+                            } else { // default to h265
+                                decoder_pipeline = "rtph265depay ! h265parse ! nvv4l2decoder drop-frame-interval=0 ! ";
+                            }
                             std::string gst_pipeline = "rtspsrc location=" + params.source + 
                                                      " protocols=tcp latency=0 drop-on-latency=true timeout=10000000"
                                                      " ntp-sync=false do-rtcp=false buffer-mode=0 retry=10 ! "
-                                                     "rtph265depay ! h265parse ! nvv4l2decoder drop-frame-interval=0 ! "
+                                                     + decoder_pipeline +
                                                      "nvvidconv interpolation-method=1 ! video/x-raw,format=BGRx ! "
                                                      "videoconvert ! video/x-raw,format=BGR ! appsink drop=true max-buffers=1 sync=false";
                             cap.open(gst_pipeline, cv::CAP_GSTREAMER);

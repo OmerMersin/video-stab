@@ -18,7 +18,7 @@ find_package(PkgConfig REQUIRED)
 # If you'd like to check exact versions, use:
 # pkg_check_modules(GST REQUIRED gstreamer-1.0>=1.14 gstreamer-rtsp-server-1.0>=1.14)
 # But here, we just require them with no version constraints:
-pkg_check_modules(GST REQUIRED gstreamer-1.0 gstreamer-rtsp-server-1.0)
+pkg_check_modules(GST REQUIRED gstreamer-1.0 gstreamer-rtsp-server-1.0 gstreamer-app-1.0)
 
 pkg_check_modules(GLIB REQUIRED glib-2.0 gobject-2.0)
 include_directories(${GLIB_INCLUDE_DIRS})
@@ -38,6 +38,8 @@ add_library(video-stab STATIC
     src/RTSPServer.cpp
     src/DeepStreamTracker.cpp
     src/TcpReciever.cpp
+    src/GstdManager.cpp
+    src/CamCapInterpipe.cpp
 )
 
 # Public headers
