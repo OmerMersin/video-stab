@@ -23,6 +23,11 @@
 #include <sys/select.h>
 #include <unistd.h>
 #include <memory>  // For std::unique_ptr
+#include <queue>   // For std::queue
+#include <atomic>  // For std::atomic
+#include <mutex>   // For std::mutex
+#include <condition_variable>  // For std::condition_variable
+#include <functional>  // For std::function
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
 #include <gst/gst.h>
@@ -47,17 +52,27 @@ private:
     int bitrate;
     bool pipelinesInitialized;
     
-    // Interpipe-based seamless switching architecture
+    // Low-level interpipe-based seamless switching architecture
     GstElement* sourcePipeline;          // RTSP source to interpipesink
-    GstElement* passthroughPipeline;     // interpipesrc -> direct output
+    GstElement* passthroughPipeline;     // interpipesrc -> interpipesink (passthrough frames)
     GstElement* processingPipeline;      // interpipesrc -> appsink (for receiving frames)
-    GstElement* processedOutputPipeline; // appsrc -> encode -> interpipesink (for processed frames)
-    GstElement* outputPipeline;          // Final output pipeline
+    GstElement* processedOutputPipeline; // appsrc -> interpipesink (for processed frames)
+    GstElement* outputPipeline;          // Persistent output pipeline that NEVER gets destroyed
     
     // Processing components
     GstElement* processingAppsink;    // Receives frames for processing
     GstElement* processingAppsrc;     // Sends processed frames
-    GstElement* switchElement;        // Input selector for seamless switching
+    GstElement* inputSelector;        // Switches between passthrough and processing modes
+    
+    // Interpipe elements for explicit control
+    GstElement* sourceInterpipeSink;     // source pipeline interpipesink
+    GstElement* passthroughInterpipeSink; // passthrough pipeline interpipesink
+    GstElement* processedInterpipeSink;   // processed output pipeline interpipesink
+    
+    // GMainLoop for GStreamer events
+    GMainLoop* mainLoop;
+    std::thread gstLoopThread;
+    std::atomic<bool> loopActive;
     
     bool streamInitialized;
     uint64_t frameCounter;
@@ -212,6 +227,8 @@ private:
     
     bool pushProcessedFrame(const cv::Mat& frame) {
         if (!processingAppsrc || frame.empty()) {
+            std::cerr << "Cannot push frame: appsrc=" << (processingAppsrc ? "valid" : "null") 
+                      << ", frame.empty=" << frame.empty() << std::endl;
             return false;
         }
         
@@ -246,6 +263,17 @@ private:
             return false;
         }
         
+        // Debug output every 30 frames
+        if (frameCounter % 30 == 0) {
+            std::cout << "✅ Pushed frame #" << frameCounter << " (" << frame.cols << "x" << frame.rows 
+                      << ") to processing output pipeline" << std::endl;
+            
+            // Check pipeline state
+            GstState state;
+            gst_element_get_state(GST_ELEMENT(processingAppsrc), &state, nullptr, 0);
+            std::cout << "  - ProcessingAppsrc state: " << gst_element_state_get_name(state) << std::endl;
+        }
+        
         return true;
     }
     
@@ -256,13 +284,19 @@ public:
         : sourceAddress(source), outputAddress(output), bitrate(bitrate), pipelinesInitialized(false),
           sourcePipeline(nullptr), passthroughPipeline(nullptr), processingPipeline(nullptr),
           processedOutputPipeline(nullptr), outputPipeline(nullptr), processingAppsink(nullptr), 
-          processingAppsrc(nullptr), switchElement(nullptr), streamInitialized(false), frameCounter(0), 
+          processingAppsrc(nullptr), inputSelector(nullptr),
+          sourceInterpipeSink(nullptr), passthroughInterpipeSink(nullptr), processedInterpipeSink(nullptr),
+          mainLoop(nullptr), loopActive(false),
+          streamInitialized(false), frameCounter(0), 
           isCurrentlyPassthrough(true), processingActive(false) {
         
         // Initialize GStreamer
         if (!gst_is_initialized()) {
             gst_init(nullptr, nullptr);
         }
+        
+        // Create main loop for GStreamer events
+        mainLoop = g_main_loop_new(nullptr, FALSE);
     }
     
     bool initialize(int width, int height, double framerate) {
@@ -272,120 +306,245 @@ public:
         
         if (streamInitialized) return true;
         
-        std::cout << "Initializing interpipe-based seamless switching system..." << std::endl;
+        std::cout << "Initializing low-level interpipe-based seamless switching system..." << std::endl;
         
         // Calculate bitrate
-        int calculatedBitrate = std::max(800, std::min(8000, static_cast<int>(frameWidth * frameHeight * fps * 0.1)));
+        int calculatedBitrate = std::max(2000000, std::min(8000000, static_cast<int>(frameWidth * frameHeight * fps * 0.1)));
         bitrate = calculatedBitrate;
         
-        // 1. SOURCE PIPELINE: RTSP source -> interpipesink
-        std::string sourcePipelineStr = 
-            "rtspsrc location=" + sourceAddress + " latency=0 protocols=tcp ! "
-            "rtph264depay ! h264parse ! "
-            "interpipesink name=source_sink sync=false";
+        // 1. SOURCE PIPELINE: RTSP source -> interpipesink (exactly like test_interpipe)
+        sourcePipeline = gst_parse_launch(
+            ("rtspsrc location=" + sourceAddress + " latency=0 ! "
+             "rtph264depay ! h264parse ! "
+             "interpipesink name=source_sink sync=false async=false").c_str(), 
+            nullptr);
         
-        std::cout << "Creating source pipeline: " << sourcePipelineStr << std::endl;
-        sourcePipeline = gst_parse_launch(sourcePipelineStr.c_str(), nullptr);
         if (!sourcePipeline) {
             std::cerr << "Failed to create source pipeline" << std::endl;
             return false;
         }
         
-        // 2. PASSTHROUGH PIPELINE: interpipesrc -> encode -> output
-        std::string passthroughPipelineStr = 
-            "interpipesrc listen-to=source_sink name=passthrough_src is-live=true do-timestamp=true ! "
-            "queue max-size-buffers=2 ! "
-            "h264parse ! "
-            "interpipesink name=passthrough_sink sync=false";
-
-        std::cout << "Creating passthrough pipeline: " << passthroughPipelineStr << std::endl;
-        passthroughPipeline = gst_parse_launch(passthroughPipelineStr.c_str(), nullptr);
+        // Get interpipesink element and set explicit caps like gstd does
+        sourceInterpipeSink = gst_bin_get_by_name(GST_BIN(sourcePipeline), "source_sink");
+        if (sourceInterpipeSink) {
+            GstCaps* h264Caps = gst_caps_from_string("video/x-h264,stream-format=byte-stream,alignment=au");
+            g_object_set(sourceInterpipeSink, "caps", h264Caps, nullptr);
+            gst_caps_unref(h264Caps);
+            std::cout << "Set explicit H264 caps on source interpipesink" << std::endl;
+        }
+        
+        // 2. PASSTHROUGH PIPELINE: interpipesrc -> direct output (ZERO LATENCY - no queues/buffers)
+        passthroughPipeline = gst_parse_launch(
+            "interpipesrc listen-to=source_sink name=passthrough_src is-live=true format=time ! "
+            "interpipesink name=passthrough_sink sync=false async=false",
+            nullptr);
+        
         if (!passthroughPipeline) {
             std::cerr << "Failed to create passthrough pipeline" << std::endl;
             return false;
         }
         
-        // 3. PROCESSING PIPELINE: interpipesrc -> appsink (for receiving frames to process)
-        std::string processingPipelineStr = 
-            "interpipesrc listen-to=source_sink name=processing_src ! "
-            "queue max-size-buffers=2 ! "
-            "appsink name=processing_sink sync=false emit-signals=true max-buffers=2 drop=true "
-            "caps=video/x-raw,format=BGR,width=" + std::to_string(frameWidth) + 
-            ",height=" + std::to_string(frameHeight);
+        // Get passthrough interpipesink and set caps
+        passthroughInterpipeSink = gst_bin_get_by_name(GST_BIN(passthroughPipeline), "passthrough_sink");
+        if (passthroughInterpipeSink) {
+            GstCaps* h264Caps = gst_caps_from_string("video/x-h264,stream-format=byte-stream,alignment=au");
+            g_object_set(passthroughInterpipeSink, "caps", h264Caps, nullptr);
+            gst_caps_unref(h264Caps);
+            std::cout << "Set explicit H264 caps on passthrough interpipesink" << std::endl;
+        }
         
-        std::cout << "Creating processing pipeline: " << processingPipelineStr << std::endl;
-        processingPipeline = gst_parse_launch(processingPipelineStr.c_str(), nullptr);
+        // 3. PROCESSING PIPELINE: interpipesrc -> decode -> appsink (for receiving frames to process)
+        processingPipeline = gst_parse_launch(
+            "interpipesrc listen-to=source_sink name=processing_src is-live=true format=time ! "
+            "queue max-size-buffers=2 leaky=downstream ! "
+            "h264parse ! nvv4l2decoder ! nvvidconv ! video/x-raw,format=BGRx ! "
+            "videoconvert ! video/x-raw,format=BGR !"
+            "appsink name=processing_sink sync=false emit-signals=true max-buffers=2 drop=true",
+            nullptr);
+
         if (!processingPipeline) {
             std::cerr << "Failed to create processing pipeline" << std::endl;
             return false;
         }
         
-        // 4. PROCESSED OUTPUT PIPELINE: appsrc -> encode -> interpipesink
-        std::string processedOutputPipelineStr =
-            "appsrc name=processing_appsrc is-live=true format=time block=false max-latency=0 "
-            "caps=video/x-raw,format=BGR,width=" + std::to_string(frameWidth) +
-            ",height=" + std::to_string(frameHeight) +
-            ",framerate=" + std::to_string(int(fps)) + "/1 ! "
-            "queue max-size-buffers=2 ! "
-            "videoconvert ! video/x-raw,format=I420 ! "
-            "x264enc tune=zerolatency speed-preset=ultrafast bitrate=" + std::to_string(bitrate) + " ! "
-            "h264parse ! interpipesink name=processing_sink sync=false";
+        // 4. PROCESSED OUTPUT PIPELINE: appsrc -> encode -> interpipesink (for processed frames)
+        processedOutputPipeline = gst_parse_launch(
+            ("appsrc name=processing_appsrc is-live=true format=time block=false max-latency=0 "
+             "caps=video/x-raw,format=BGR,width=" + std::to_string(frameWidth) +
+             ",height=" + std::to_string(frameHeight) +
+             ",framerate=" + std::to_string(int(fps)) + "/1 ! "
+             "queue max-size-buffers=2 leaky=downstream ! "
+             "videoconvert ! video/x-raw,format=I420 ! "
+             "x264enc tune=zerolatency speed-preset=superfast bitrate=" + std::to_string(bitrate/1000) + " key-int-max=30 ! "
+             "h264parse ! "
+             "interpipesink name=processed_sink sync=false async=false").c_str(),
+            nullptr);
         
-        std::cout << "Creating processed output pipeline: " << processedOutputPipelineStr << std::endl;
-        processedOutputPipeline = gst_parse_launch(processedOutputPipelineStr.c_str(), nullptr);
         if (!processedOutputPipeline) {
             std::cerr << "Failed to create processed output pipeline" << std::endl;
             return false;
         }
         
-        // 5. OUTPUT PIPELINE: input-selector -> RTSP output
-        std::string outputPipelineStr = 
-            "input-selector name=switch ! "
-            "queue max-size-buffers=2 ! "
-            "rtspclientsink location=" + outputAddress + " protocols=tcp latency=0 "
-            "interpipesrc listen-to=passthrough_sink name=passthrough_input ! switch.sink_0 "
-            "interpipesrc listen-to=processing_sink name=processing_input ! switch.sink_1";
+        // Get processed interpipesink and set caps
+        processedInterpipeSink = gst_bin_get_by_name(GST_BIN(processedOutputPipeline), "processing_sink");
+        if (processedInterpipeSink) {
+            GstCaps* h264Caps = gst_caps_from_string("video/x-h264,stream-format=byte-stream,alignment=au");
+            g_object_set(processedInterpipeSink, "caps", h264Caps, nullptr);
+            gst_caps_unref(h264Caps);
+            std::cout << "Set explicit H264 caps on processed interpipesink" << std::endl;
+        }
         
-        std::cout << "Creating output pipeline: " << outputPipelineStr << std::endl;
-        outputPipeline = gst_parse_launch(outputPipelineStr.c_str(), nullptr);
+        // 5. PERSISTENT OUTPUT PIPELINE: Build programmatically for proper connections
+        outputPipeline = gst_pipeline_new("output_pipeline");
+        
+        // Create elements
+        GstElement* passthroughInput = gst_element_factory_make("interpipesrc", "passthrough_input");
+        GstElement* processingInput = gst_element_factory_make("interpipesrc", "processing_input");
+        inputSelector = gst_element_factory_make("input-selector", "mode_selector");
+        GstElement* queue = gst_element_factory_make("queue", "output_queue");
+        GstElement* rtspSink = gst_element_factory_make("rtspclientsink", "rtsp_sink");
+        
+        if (!passthroughInput || !processingInput || !inputSelector || !queue || !rtspSink) {
+            std::cerr << "Failed to create output pipeline elements" << std::endl;
+            return false;
+        }
+        
+        // Configure elements
+        g_object_set(passthroughInput, 
+                     "listen-to", "passthrough_sink",
+                     "is-live", TRUE,
+                     NULL);
+        g_object_set(processingInput, 
+                     "listen-to", "processing_sink",
+                     "is-live", TRUE,
+                     NULL);
+        g_object_set(queue,
+                     "max-size-time", (guint64)20000000,
+                     "max-size-buffers", 1,
+                     "max-size-bytes", 0,
+                     NULL);
+        g_object_set(rtspSink,
+                     "location", outputAddress.c_str(),
+                     "protocols", 4, // TCP
+                     "latency", 0,
+                     NULL);
+        
+        // Add elements to pipeline
+        gst_bin_add_many(GST_BIN(outputPipeline), 
+                         passthroughInput, processingInput, inputSelector, queue, rtspSink, 
+                         NULL);
+        
+        // Link: input-selector -> queue -> rtsp_sink
+        if (!gst_element_link_many(inputSelector, queue, rtspSink, NULL)) {
+            std::cerr << "Failed to link output pipeline elements" << std::endl;
+            return false;
+        }
+        
+        // Connect interpipesrc to input-selector pads
+        GstPad* selectorSink0 = gst_element_request_pad_simple(inputSelector, "sink_%u");
+        GstPad* selectorSink1 = gst_element_request_pad_simple(inputSelector, "sink_%u");
+        GstPad* passthroughSrc = gst_element_get_static_pad(passthroughInput, "src");
+        GstPad* processingSrc = gst_element_get_static_pad(processingInput, "src");
+        
+        if (!selectorSink0 || !selectorSink1 || !passthroughSrc || !processingSrc) {
+            std::cerr << "Failed to get pads for output pipeline linking" << std::endl;
+            return false;
+        }
+        
+        if (gst_pad_link(passthroughSrc, selectorSink0) != GST_PAD_LINK_OK ||
+            gst_pad_link(processingSrc, selectorSink1) != GST_PAD_LINK_OK) {
+            std::cerr << "Failed to link interpipesrc to input-selector" << std::endl;
+            return false;
+        }
+        
+        // Clean up pad references
+        gst_object_unref(passthroughSrc);
+        gst_object_unref(processingSrc);
+        gst_object_unref(selectorSink0);
+        gst_object_unref(selectorSink1);
+        
+        // Add a probe to debug data flow through input-selector
+        GstPad* selectorSrcPad = gst_element_get_static_pad(inputSelector, "src");
+        if (selectorSrcPad) {
+            gst_pad_add_probe(selectorSrcPad, GST_PAD_PROBE_TYPE_BUFFER,
+                             [](GstPad* pad, GstPadProbeInfo* info, gpointer user_data) -> GstPadProbeReturn {
+                                 static int bufferCount = 0;
+                                 bufferCount++;
+                                 if (bufferCount % 30 == 0) {
+                                     std::cout << "🔄 Buffer #" << bufferCount << " flowing through input-selector" << std::endl;
+                                 }
+                                 return GST_PAD_PROBE_OK;
+                             }, nullptr, nullptr);
+            gst_object_unref(selectorSrcPad);
+        }
+        
         if (!outputPipeline) {
             std::cerr << "Failed to create output pipeline" << std::endl;
             return false;
         }
         
-        // Get elements
+        // inputSelector is already created above
+        
+        // Get elements for runtime control
         processingAppsink = gst_bin_get_by_name(GST_BIN(processingPipeline), "processing_sink");
         processingAppsrc = gst_bin_get_by_name(GST_BIN(processedOutputPipeline), "processing_appsrc");
-        switchElement = gst_bin_get_by_name(GST_BIN(outputPipeline), "switch");
         
-        if (!processingAppsink || !processingAppsrc || !switchElement) {
+        if (!processingAppsink || !processingAppsrc || !inputSelector) {
             std::cerr << "Failed to get required elements" << std::endl;
             return false;
         }
         
-        // Set up appsink callback
+        // Set input-selector to passthrough mode initially
+        // We need to get the first sink pad (which is sink_0)
+        GstIterator* padIter = gst_element_iterate_sink_pads(inputSelector);
+        GValue padValue = G_VALUE_INIT;
+        GstPad* firstPad = nullptr;
+        
+        if (gst_iterator_next(padIter, &padValue) == GST_ITERATOR_OK) {
+            firstPad = GST_PAD(g_value_get_object(&padValue));
+            g_object_set(inputSelector, "active-pad", firstPad, nullptr);
+            std::cout << "Set input-selector to passthrough mode (first sink pad)" << std::endl;
+            g_value_unset(&padValue);
+        } else {
+            std::cerr << "Failed to get first sink pad from input-selector" << std::endl;
+        }
+        gst_iterator_free(padIter);
+        
+        // Set up appsink callback for frame processing
         g_signal_connect(processingAppsink, "new-sample", G_CALLBACK(newSampleCallback), this);
         
-        // Set up bus callbacks
+        // Set up bus callbacks for all pipelines
         setupBusCallbacks();
         
-        // Start all pipelines
-        if (!startAllPipelines()) {
-            std::cerr << "Failed to start pipelines" << std::endl;
-            return false;
-        }
+        // Start GStreamer main loop in separate thread
+        loopActive.store(true);
+        gstLoopThread = std::thread([this]() {
+            std::cout << "Starting GStreamer main loop" << std::endl;
+            g_main_loop_run(mainLoop);
+            std::cout << "GStreamer main loop stopped" << std::endl;
+        });
+        
+        // Set pipelines as initialized BEFORE starting them
+        pipelinesInitialized = true;
         
         // Start processing thread
         processingActive.store(true);
         processingThread = std::thread(&GStreamerPipelineManager::frameProcessingThread, this);
         
-        // Start in passthrough mode
-        switchToPassthrough();
+        // Start pipelines for initial passthrough mode
+        std::cout << "Starting pipelines for initial passthrough mode..." << std::endl;
+        gst_element_set_state(sourcePipeline, GST_STATE_PLAYING);
+        gst_element_set_state(passthroughPipeline, GST_STATE_PLAYING);
+        gst_element_set_state(outputPipeline, GST_STATE_PLAYING);
         
-        pipelinesInitialized = true;
+        // Keep processing pipelines in NULL state initially
+        gst_element_set_state(processingPipeline, GST_STATE_NULL);
+        gst_element_set_state(processedOutputPipeline, GST_STATE_NULL);
+        
         streamInitialized = true;
+        isCurrentlyPassthrough = true;
         
-        std::cout << "Interpipe-based seamless switching system initialized successfully!" << std::endl;
+        std::cout << "✅ Pipeline system initialized in PASSTHROUGH mode" << std::endl;
         return true;
     }
     
@@ -412,53 +571,10 @@ public:
         gst_object_unref(outputBus);
     }
     
-    bool startAllPipelines() {
-        std::cout << "Starting all pipelines..." << std::endl;
-        
-        // Start source pipeline first
-        if (gst_element_set_state(sourcePipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
-            std::cerr << "Failed to start source pipeline" << std::endl;
-            return false;
-        }
-        
-        // Start passthrough pipeline
-        if (gst_element_set_state(passthroughPipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
-            std::cerr << "Failed to start passthrough pipeline" << std::endl;
-            return false;
-        }
-        
-        // Start processing pipeline
-        if (gst_element_set_state(processingPipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
-            std::cerr << "Failed to start processing pipeline" << std::endl;
-            return false;
-        }
-        
-        // Start processed output pipeline
-        if (gst_element_set_state(processedOutputPipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
-            std::cerr << "Failed to start processed output pipeline" << std::endl;
-            return false;
-        }
-        
-        // Start output pipeline
-        if (gst_element_set_state(outputPipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
-            std::cerr << "Failed to start output pipeline" << std::endl;
-            return false;
-        }
-        
-        // Wait for all pipelines to start
-        gst_element_get_state(sourcePipeline, nullptr, nullptr, 5 * GST_SECOND);
-        gst_element_get_state(passthroughPipeline, nullptr, nullptr, 5 * GST_SECOND);
-        gst_element_get_state(processingPipeline, nullptr, nullptr, 5 * GST_SECOND);
-        gst_element_get_state(processedOutputPipeline, nullptr, nullptr, 5 * GST_SECOND);
-        gst_element_get_state(outputPipeline, nullptr, nullptr, 5 * GST_SECOND);
-        
-        std::cout << "All pipelines started successfully" << std::endl;
-        return true;
-    }
     
     bool switchToPassthrough() {
-        if (!pipelinesInitialized || !switchElement) {
-            std::cerr << "Pipeline not initialized or switch element not found" << std::endl;
+        if (!pipelinesInitialized) {
+            std::cerr << "Pipelines not initialized" << std::endl;
             return false;
         }
         
@@ -467,20 +583,62 @@ public:
             return true;
         }
         
-        std::cout << "Switching to PASSTHROUGH mode..." << std::endl;
+        std::cout << "=== SWITCHING TO PASSTHROUGH MODE ===" << std::endl;
         
-        // Switch input-selector to passthrough input (sink_0)
-        g_object_set(switchElement, "active-pad", 
-                     gst_element_get_static_pad(switchElement, "sink_0"), nullptr);
+        // Start passthrough pipeline FIRST
+        std::cout << "Starting passthrough pipeline..." << std::endl;
+        if (gst_element_set_state(passthroughPipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+            std::cerr << "Failed to start passthrough pipeline" << std::endl;
+            return false;
+        }
+        
+        // Wait for passthrough pipeline to stabilize
+        std::cout << "Waiting for passthrough pipeline to stabilize..." << std::endl;
+        g_usleep(300000); // 300ms
+        
+        // Ensure passthrough pipeline is actually PLAYING
+        GstState state;
+        gst_element_get_state(passthroughPipeline, &state, nullptr, GST_CLOCK_TIME_NONE);
+        if (state != GST_STATE_PLAYING) {
+            std::cerr << "Passthrough pipeline failed to reach PLAYING state: " << gst_element_state_get_name(state) << std::endl;
+            return false;
+        }
+        
+        std::cout << "Passthrough pipeline confirmed PLAYING" << std::endl;
+        
+        // Switch input-selector to passthrough (first sink pad - passthrough)
+        GstIterator* padIter = gst_element_iterate_sink_pads(inputSelector);
+        GValue padValue = G_VALUE_INIT;
+        GstPad* firstPad = nullptr;
+        
+        if (gst_iterator_next(padIter, &padValue) == GST_ITERATOR_OK) {
+            firstPad = GST_PAD(g_value_get_object(&padValue));
+            g_object_set(inputSelector, "active-pad", firstPad, nullptr);
+            std::cout << "Switched input-selector to passthrough (first sink pad)" << std::endl;
+            g_value_unset(&padValue);
+        } else {
+            std::cerr << "Failed to get first sink pad for passthrough switching" << std::endl;
+            gst_iterator_free(padIter);
+            return false;
+        }
+        gst_iterator_free(padIter);
+        
+        // Wait a bit for the switch to take effect
+        g_usleep(200000); // 200ms
+        
+        // Stop processing pipelines to save resources
+        gst_element_set_state(processingPipeline, GST_STATE_NULL);
+        gst_element_set_state(processedOutputPipeline, GST_STATE_NULL);
         
         isCurrentlyPassthrough = true;
-        std::cout << "Seamlessly switched to PASSTHROUGH mode!" << std::endl;
+        
+        std::cout << "✅ Successfully switched to ZERO-LATENCY passthrough mode" << std::endl;
         return true;
     }
     
     bool switchToProcessing() {
-        if (!pipelinesInitialized || !switchElement) {
-            std::cerr << "Pipeline not initialized or switch element not found" << std::endl;
+        if (!pipelinesInitialized) {
+            std::cerr << "Pipelines not initialized" << std::endl;
             return false;
         }
         
@@ -489,14 +647,76 @@ public:
             return true;
         }
         
-        std::cout << "Switching to PROCESSING mode..." << std::endl;
+        std::cout << "=== SWITCHING TO PROCESSING MODE ===" << std::endl;
         
-        // Switch input-selector to processing input (sink_1)
-        g_object_set(switchElement, "active-pad", 
-                     gst_element_get_static_pad(switchElement, "sink_1"), nullptr);
+        // Start processing pipelines FIRST
+        std::cout << "Starting processing pipeline..." << std::endl;
+        if (gst_element_set_state(processingPipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+            std::cerr << "Failed to start processing pipeline" << std::endl;
+            return false;
+        }
+        
+        std::cout << "Starting processed output pipeline..." << std::endl;
+        if (gst_element_set_state(processedOutputPipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+            std::cerr << "Failed to start processed output pipeline" << std::endl;
+            return false;
+        }
+        
+        // Wait for processing pipelines to fully start and stabilize
+        std::cout << "Waiting for processing pipelines to stabilize..." << std::endl;
+        g_usleep(500000); // 500ms - longer wait for proper startup
+        
+        // Ensure processing pipeline is actually PLAYING
+        GstState state;
+        gst_element_get_state(processingPipeline, &state, nullptr, GST_CLOCK_TIME_NONE);
+        if (state != GST_STATE_PLAYING) {
+            std::cerr << "Processing pipeline failed to reach PLAYING state: " << gst_element_state_get_name(state) << std::endl;
+            return false;
+        }
+        
+        gst_element_get_state(processedOutputPipeline, &state, nullptr, GST_CLOCK_TIME_NONE);
+        if (state != GST_STATE_PLAYING) {
+            std::cerr << "Processed output pipeline failed to reach PLAYING state: " << gst_element_state_get_name(state) << std::endl;
+            return false;
+        }
+        
+        std::cout << "Both processing pipelines confirmed PLAYING" << std::endl;
+        
+        // Now switch input-selector to processing (second sink pad - processing)
+        GstIterator* padIter = gst_element_iterate_sink_pads(inputSelector);
+        GValue padValue = G_VALUE_INIT;
+        GstPad* secondPad = nullptr;
+        
+        // Skip first pad
+        if (gst_iterator_next(padIter, &padValue) == GST_ITERATOR_OK) {
+            g_value_unset(&padValue);
+            // Get second pad
+            if (gst_iterator_next(padIter, &padValue) == GST_ITERATOR_OK) {
+                secondPad = GST_PAD(g_value_get_object(&padValue));
+                g_object_set(inputSelector, "active-pad", secondPad, nullptr);
+                std::cout << "Switched input-selector to processing (second sink pad)" << std::endl;
+                g_value_unset(&padValue);
+            } else {
+                std::cerr << "Failed to get second sink pad for processing switching" << std::endl;
+                gst_iterator_free(padIter);
+                return false;
+            }
+        } else {
+            std::cerr << "Failed to iterate sink pads for processing switching" << std::endl;
+            gst_iterator_free(padIter);
+            return false;
+        }
+        gst_iterator_free(padIter);
+        
+        // Wait a bit for the switch to take effect
+        g_usleep(200000); // 200ms
+        
+        // Stop passthrough pipeline to save resources
+        gst_element_set_state(passthroughPipeline, GST_STATE_NULL);
         
         isCurrentlyPassthrough = false;
-        std::cout << "Seamlessly switched to PROCESSING mode!" << std::endl;
+        
+        std::cout << "✅ Successfully switched to processing mode" << std::endl;
         return true;
     }
     
@@ -552,16 +772,29 @@ public:
         }
         if (processedOutputPipeline) {
             gst_element_get_state(processedOutputPipeline, &processedOutputState, nullptr, 0);
-            std::cout << "  - Processed Output Pipeline: " << gst_element_state_get_name(processedOutputState) << std::endl;
+            std::cout << "  - Processed Output Pipeline (Direct RTSP): " << gst_element_state_get_name(processedOutputState) << std::endl;
         }
         if (outputPipeline) {
             gst_element_get_state(outputPipeline, &outputState, nullptr, 0);
             std::cout << "  - Output Pipeline: " << gst_element_state_get_name(outputState) << std::endl;
+        } else if (!isCurrentlyPassthrough) {
+            std::cout << "  - Output Pipeline: Using direct RTSP (processedOutputPipeline)" << std::endl;
         }
     }
     
     void cleanup() {
-        std::cout << "Cleaning up interpipe pipeline manager..." << std::endl;
+        std::cout << "Cleaning up low-level interpipe pipeline manager..." << std::endl;
+        
+        // Stop GStreamer main loop
+        if (loopActive.load()) {
+            loopActive.store(false);
+            if (mainLoop) {
+                g_main_loop_quit(mainLoop);
+            }
+            if (gstLoopThread.joinable()) {
+                gstLoopThread.join();
+            }
+        }
         
         // Stop processing thread
         processingActive.store(false);
@@ -610,15 +843,33 @@ public:
             gst_object_unref(processingAppsrc);
             processingAppsrc = nullptr;
         }
-        if (switchElement) {
-            gst_object_unref(switchElement);
-            switchElement = nullptr;
+        if (inputSelector) {
+            gst_object_unref(inputSelector);
+            inputSelector = nullptr;
+        }
+        if (sourceInterpipeSink) {
+            gst_object_unref(sourceInterpipeSink);
+            sourceInterpipeSink = nullptr;
+        }
+        if (passthroughInterpipeSink) {
+            gst_object_unref(passthroughInterpipeSink);
+            passthroughInterpipeSink = nullptr;
+        }
+        if (processedInterpipeSink) {
+            gst_object_unref(processedInterpipeSink);
+            processedInterpipeSink = nullptr;
+        }
+        
+        // Clean up main loop
+        if (mainLoop) {
+            g_main_loop_unref(mainLoop);
+            mainLoop = nullptr;
         }
         
         pipelinesInitialized = false;
         streamInitialized = false;
         
-        std::cout << "Interpipe pipeline manager cleanup complete" << std::endl;
+        std::cout << "Low-level interpipe pipeline manager cleanup complete" << std::endl;
     }
     
     ~GStreamerPipelineManager() {
@@ -814,6 +1065,7 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "Using video source: " << videoSource << std::endl;
+    std::cout << "Enhancer: " << (runParams.enhancerEnabled ? "Enabled" : "Disabled") << std::endl;
     std::cout << "Roll Correction: " << (runParams.rollCorrectionEnabled ? "Enabled" : "Disabled") << std::endl;
     std::cout << "Stabilizer: " << (runParams.stabilizationEnabled ? "Enabled" : "Disabled") << std::endl;
     std::cout << "Tracker: " << (runParams.trackerEnabled ? "Enabled" : "Disabled") << std::endl;
@@ -841,6 +1093,8 @@ int main(int argc, char** argv) {
                          !runParams.rollCorrectionEnabled && 
                          !runParams.stabilizationEnabled &&
                          !runParams.trackerEnabled;
+
+    std::cout << "Determined mode: " << (usePassthrough ? "PASSTHROUGH" : "PROCESSING") << std::endl;
 
     // Create and initialize pipeline manager with source and output addresses
     std::string sourceAddress = videoSource;  // Use video source from config
