@@ -1,0 +1,68 @@
+# Configuration file for gstd-based interpipe streaming system
+
+# Input video source (RTSP stream)
+video_source: "rtsp://192.168.1.100:8554/camera1"
+
+# Processing mode parameters
+mode:
+  width: 1920
+  height: 1080
+  optimize_fps: true
+  use_cuda: true
+  enhancer_enabled: false
+  roll_correction_enabled: false
+  stabilizer_enabled: false
+  tracker_enabled: false
+
+# Enhancement parameters
+enhancer:
+  brightness: 0.0
+  contrast: 1.0
+  enable_white_balance: false
+  wb_strength: 0.5
+  enable_vibrance: false
+  vibrance_strength: 0.3
+  enable_unsharp: false
+  sharpness: 1.0
+  blur_sigma: 1.0
+  enable_denoise: false
+  denoise_strength: 0.3
+  gamma: 1.0
+  enable_clahe: false
+  clahe_clip_limit: 2.0
+  clahe_tile_grid_size: 8
+  use_cuda: true
+
+# Roll correction parameters
+roll_correction:
+  scale_factor: 0.5
+  canny_threshold_low: 50
+  canny_threshold_high: 150
+  canny_aperture: 3
+  hough_rho: 1.0
+  hough_theta: 0.017453292519943295  # π/180
+  hough_threshold: 100
+  angle_smoothing_alpha: 0.1
+  angle_decay: 0.995
+  angle_filter_min: -30.0
+  angle_filter_max: 30.0
+
+# Stabilization parameters
+stabilizer:
+  smoothing_radius: 30
+  border_type: 1
+  border_size: 10
+  crop_n_zoom: 0.1
+  logging: false
+  use_cuda: true
+
+# Tracker parameters
+deepstream_tracker:
+  model_engine: "/opt/nvidia/deepstream/deepstream-7.1/samples/models/Primary_Detector/resnet18_trafficcamnet.etlt_b8_gpu0_int8.engine"
+  model_config_file: "/opt/nvidia/deepstream/deepstream-7.1/samples/configs/deepstream-app/config_infer_primary_resnet18.txt"
+  tracker_config_file: ""
+  processing_width: 640
+  processing_height: 368
+  confidence_threshold: 0.3
+  batch_size: 1
+  debug_mode: false
