@@ -65,7 +65,7 @@ stabilizer:
   border_type: "replicate"    # Most efficient border type
   fadeDuration: 30
   fadeAlpha: 0.9
-  border_size: 10             # Increased for better stability
+  border_size: 0             # Increased for better stability
   crop_n_zoom: 0
   logging: false              # Disable logging for performance
   use_cuda: true
