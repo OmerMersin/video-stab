@@ -63,6 +63,7 @@ private:
     GstElement* processingAppsink;    // Receives frames for processing
     GstElement* processingAppsrc;     // Sends processed frames
     GstElement* inputSelector;        // Switches between passthrough and processing modes
+    GstElement* outputSource;         // interpipesrc in output pipeline for switching
     
     // Interpipe elements for explicit control
     GstElement* sourceInterpipeSink;     // source pipeline interpipesink
@@ -386,7 +387,7 @@ public:
         }
         
         // Get processed interpipesink and set caps
-        processedInterpipeSink = gst_bin_get_by_name(GST_BIN(processedOutputPipeline), "processing_sink");
+        processedInterpipeSink = gst_bin_get_by_name(GST_BIN(processedOutputPipeline), "processed_sink");
         if (processedInterpipeSink) {
             GstCaps* h264Caps = gst_caps_from_string("video/x-h264,stream-format=byte-stream,alignment=au");
             g_object_set(processedInterpipeSink, "caps", h264Caps, nullptr);
@@ -394,121 +395,33 @@ public:
             std::cout << "Set explicit H264 caps on processed interpipesink" << std::endl;
         }
         
-        // 5. PERSISTENT OUTPUT PIPELINE: Build programmatically for proper connections
-        outputPipeline = gst_pipeline_new("output_pipeline");
-        
-        // Create elements
-        GstElement* passthroughInput = gst_element_factory_make("interpipesrc", "passthrough_input");
-        GstElement* processingInput = gst_element_factory_make("interpipesrc", "processing_input");
-        inputSelector = gst_element_factory_make("input-selector", "mode_selector");
-        GstElement* queue = gst_element_factory_make("queue", "output_queue");
-        GstElement* rtspSink = gst_element_factory_make("rtspclientsink", "rtsp_sink");
-        
-        if (!passthroughInput || !processingInput || !inputSelector || !queue || !rtspSink) {
-            std::cerr << "Failed to create output pipeline elements" << std::endl;
-            return false;
-        }
-        
-        // Configure elements
-        g_object_set(passthroughInput, 
-                     "listen-to", "passthrough_sink",
-                     "is-live", TRUE,
-                     NULL);
-        g_object_set(processingInput, 
-                     "listen-to", "processing_sink",
-                     "is-live", TRUE,
-                     NULL);
-        g_object_set(queue,
-                     "max-size-time", (guint64)20000000,
-                     "max-size-buffers", 1,
-                     "max-size-bytes", 0,
-                     NULL);
-        g_object_set(rtspSink,
-                     "location", outputAddress.c_str(),
-                     "protocols", 4, // TCP
-                     "latency", 0,
-                     NULL);
-        
-        // Add elements to pipeline
-        gst_bin_add_many(GST_BIN(outputPipeline), 
-                         passthroughInput, processingInput, inputSelector, queue, rtspSink, 
-                         NULL);
-        
-        // Link: input-selector -> queue -> rtsp_sink
-        if (!gst_element_link_many(inputSelector, queue, rtspSink, NULL)) {
-            std::cerr << "Failed to link output pipeline elements" << std::endl;
-            return false;
-        }
-        
-        // Connect interpipesrc to input-selector pads
-        GstPad* selectorSink0 = gst_element_request_pad_simple(inputSelector, "sink_%u");
-        GstPad* selectorSink1 = gst_element_request_pad_simple(inputSelector, "sink_%u");
-        GstPad* passthroughSrc = gst_element_get_static_pad(passthroughInput, "src");
-        GstPad* processingSrc = gst_element_get_static_pad(processingInput, "src");
-        
-        if (!selectorSink0 || !selectorSink1 || !passthroughSrc || !processingSrc) {
-            std::cerr << "Failed to get pads for output pipeline linking" << std::endl;
-            return false;
-        }
-        
-        if (gst_pad_link(passthroughSrc, selectorSink0) != GST_PAD_LINK_OK ||
-            gst_pad_link(processingSrc, selectorSink1) != GST_PAD_LINK_OK) {
-            std::cerr << "Failed to link interpipesrc to input-selector" << std::endl;
-            return false;
-        }
-        
-        // Clean up pad references
-        gst_object_unref(passthroughSrc);
-        gst_object_unref(processingSrc);
-        gst_object_unref(selectorSink0);
-        gst_object_unref(selectorSink1);
-        
-        // Add a probe to debug data flow through input-selector
-        GstPad* selectorSrcPad = gst_element_get_static_pad(inputSelector, "src");
-        if (selectorSrcPad) {
-            gst_pad_add_probe(selectorSrcPad, GST_PAD_PROBE_TYPE_BUFFER,
-                             [](GstPad* pad, GstPadProbeInfo* info, gpointer user_data) -> GstPadProbeReturn {
-                                 static int bufferCount = 0;
-                                 bufferCount++;
-                                 if (bufferCount % 30 == 0) {
-                                     std::cout << "🔄 Buffer #" << bufferCount << " flowing through input-selector" << std::endl;
-                                 }
-                                 return GST_PAD_PROBE_OK;
-                             }, nullptr, nullptr);
-            gst_object_unref(selectorSrcPad);
-        }
+        // 5. SIMPLE OUTPUT PIPELINE: interpipesrc -> RTSP (starts with passthrough)
+        outputPipeline = gst_parse_launch(
+            ("interpipesrc listen-to=passthrough_sink name=output_source is-live=true format=time ! "
+             "queue max-size-buffers=1 leaky=downstream ! "
+             "rtspclientsink location=" + outputAddress + " protocols=tcp latency=0").c_str(),
+            nullptr);
         
         if (!outputPipeline) {
             std::cerr << "Failed to create output pipeline" << std::endl;
             return false;
         }
         
-        // inputSelector is already created above
+        // Get the interpipesrc element for switching
+        outputSource = gst_bin_get_by_name(GST_BIN(outputPipeline), "output_source");
+        if (!outputSource) {
+            std::cerr << "Failed to get output source element" << std::endl;
+            return false;
+        }
         
         // Get elements for runtime control
         processingAppsink = gst_bin_get_by_name(GST_BIN(processingPipeline), "processing_sink");
         processingAppsrc = gst_bin_get_by_name(GST_BIN(processedOutputPipeline), "processing_appsrc");
         
-        if (!processingAppsink || !processingAppsrc || !inputSelector) {
+        if (!processingAppsink || !processingAppsrc || !outputSource) {
             std::cerr << "Failed to get required elements" << std::endl;
             return false;
         }
-        
-        // Set input-selector to passthrough mode initially
-        // We need to get the first sink pad (which is sink_0)
-        GstIterator* padIter = gst_element_iterate_sink_pads(inputSelector);
-        GValue padValue = G_VALUE_INIT;
-        GstPad* firstPad = nullptr;
-        
-        if (gst_iterator_next(padIter, &padValue) == GST_ITERATOR_OK) {
-            firstPad = GST_PAD(g_value_get_object(&padValue));
-            g_object_set(inputSelector, "active-pad", firstPad, nullptr);
-            std::cout << "Set input-selector to passthrough mode (first sink pad)" << std::endl;
-            g_value_unset(&padValue);
-        } else {
-            std::cerr << "Failed to get first sink pad from input-selector" << std::endl;
-        }
-        gst_iterator_free(padIter);
         
         // Set up appsink callback for frame processing
         g_signal_connect(processingAppsink, "new-sample", G_CALLBACK(newSampleCallback), this);
@@ -596,32 +509,9 @@ public:
         std::cout << "Waiting for passthrough pipeline to stabilize..." << std::endl;
         g_usleep(300000); // 300ms
         
-        // Ensure passthrough pipeline is actually PLAYING
-        GstState state;
-        gst_element_get_state(passthroughPipeline, &state, nullptr, GST_CLOCK_TIME_NONE);
-        if (state != GST_STATE_PLAYING) {
-            std::cerr << "Passthrough pipeline failed to reach PLAYING state: " << gst_element_state_get_name(state) << std::endl;
-            return false;
-        }
-        
-        std::cout << "Passthrough pipeline confirmed PLAYING" << std::endl;
-        
-        // Switch input-selector to passthrough (first sink pad - passthrough)
-        GstIterator* padIter = gst_element_iterate_sink_pads(inputSelector);
-        GValue padValue = G_VALUE_INIT;
-        GstPad* firstPad = nullptr;
-        
-        if (gst_iterator_next(padIter, &padValue) == GST_ITERATOR_OK) {
-            firstPad = GST_PAD(g_value_get_object(&padValue));
-            g_object_set(inputSelector, "active-pad", firstPad, nullptr);
-            std::cout << "Switched input-selector to passthrough (first sink pad)" << std::endl;
-            g_value_unset(&padValue);
-        } else {
-            std::cerr << "Failed to get first sink pad for passthrough switching" << std::endl;
-            gst_iterator_free(padIter);
-            return false;
-        }
-        gst_iterator_free(padIter);
+        // Switch output source to listen to passthrough_sink
+        g_object_set(outputSource, "listen-to", "passthrough_sink", NULL);
+        std::cout << "Switched output source to passthrough_sink" << std::endl;
         
         // Wait a bit for the switch to take effect
         g_usleep(200000); // 200ms
@@ -682,31 +572,9 @@ public:
         
         std::cout << "Both processing pipelines confirmed PLAYING" << std::endl;
         
-        // Now switch input-selector to processing (second sink pad - processing)
-        GstIterator* padIter = gst_element_iterate_sink_pads(inputSelector);
-        GValue padValue = G_VALUE_INIT;
-        GstPad* secondPad = nullptr;
-        
-        // Skip first pad
-        if (gst_iterator_next(padIter, &padValue) == GST_ITERATOR_OK) {
-            g_value_unset(&padValue);
-            // Get second pad
-            if (gst_iterator_next(padIter, &padValue) == GST_ITERATOR_OK) {
-                secondPad = GST_PAD(g_value_get_object(&padValue));
-                g_object_set(inputSelector, "active-pad", secondPad, nullptr);
-                std::cout << "Switched input-selector to processing (second sink pad)" << std::endl;
-                g_value_unset(&padValue);
-            } else {
-                std::cerr << "Failed to get second sink pad for processing switching" << std::endl;
-                gst_iterator_free(padIter);
-                return false;
-            }
-        } else {
-            std::cerr << "Failed to iterate sink pads for processing switching" << std::endl;
-            gst_iterator_free(padIter);
-            return false;
-        }
-        gst_iterator_free(padIter);
+        // Switch output source to listen to processed_sink instead of passthrough_sink
+        g_object_set(outputSource, "listen-to", "processed_sink", NULL);
+        std::cout << "Switched output source to processed_sink" << std::endl;
         
         // Wait a bit for the switch to take effect
         g_usleep(200000); // 200ms

@@ -10,3 +10,7 @@ main-gstd-final	zero			-			no
 main-gstd-jetson zero			-			no
 main-gst-gstd-capi -			-			-
 final-gstd-try	-			-			-
+vs		mid-glitchy		mid-glitchy		yes
+vs copy		low			-			no
+vs copy 2	zero			low			yes-start with passthrough
+vsg		zero			low			yes
