@@ -834,15 +834,105 @@ bool readConfig(
         rollNode["angle_filter_max"] >> rollParams.angleFilterMax;
     }
 
-    // Read Stabilizer Parameters
+    // Read Stabilizer Parameters - Professional Grade (iPhone/GoPro-like)
     cv::FileNode stabNode = fs["stabilizer"];
     if (!stabNode.empty()) {
+        // Basic parameters
         stabNode["smoothing_radius"] >> stabParams.smoothingRadius;
         stabNode["border_type"] >> stabParams.borderType;
         stabNode["border_size"] >> stabParams.borderSize;
         stabNode["crop_n_zoom"] >> stabParams.cropNZoom;
         stabNode["logging"] >> stabParams.logging;
         stabNode["use_cuda"] >> stabParams.useCuda;
+        
+        // Professional smoothing methods
+        stabNode["smoothing_method"] >> stabParams.smoothingMethod;
+        stabNode["gaussian_sigma"] >> stabParams.gaussianSigma;
+        
+        // Multi-stage smoothing (Sightline-inspired)
+        stabNode["stage_one_radius"] >> stabParams.stageOneRadius;
+        stabNode["stage_two_radius"] >> stabParams.stageTwoRadius;
+        stabNode["use_temporal_filtering"] >> stabParams.useTemporalFiltering;
+        stabNode["temporal_window_size"] >> stabParams.temporalWindowSize;
+        
+        // Adaptive smoothing
+        stabNode["adaptive_smoothing"] >> stabParams.adaptiveSmoothing;
+        stabNode["min_smoothing_radius"] >> stabParams.minSmoothingRadius;
+        stabNode["max_smoothing_radius"] >> stabParams.maxSmoothingRadius;
+        
+        // Feature detection parameters
+        stabNode["max_corners"] >> stabParams.maxCorners;
+        stabNode["quality_level"] >> stabParams.qualityLevel;
+        stabNode["min_distance"] >> stabParams.minDistance;
+        stabNode["block_size"] >> stabParams.blockSize;
+        
+        // Motion analysis
+        stabNode["outlier_threshold"] >> stabParams.outlierThreshold;
+        stabNode["motion_prediction"] >> stabParams.motionPrediction;
+        stabNode["intentional_motion_threshold"] >> stabParams.intentionalMotionThreshold;
+        
+        // Professional jitter filtering
+        int jitterFreq = 3; // Default to ADAPTIVE
+        stabNode["jitter_frequency"] >> jitterFreq;
+        stabParams.jitterFrequency = static_cast<vs::Stabilizer::Parameters::JitterFrequency>(jitterFreq);
+        stabNode["separate_translation_rotation"] >> stabParams.separateTranslationRotation;
+        
+        // Advanced features
+        stabNode["deep_stabilization"] >> stabParams.deepStabilization;
+        stabNode["model_path"] >> stabParams.modelPath;
+        stabNode["roll_compensation"] >> stabParams.rollCompensation;
+        stabNode["roll_compensation_factor"] >> stabParams.rollCompensationFactor;
+        
+        // Region of Interest
+        stabNode["use_roi"] >> stabParams.useROI;
+        if (stabParams.useROI) {
+            int roiX = 0, roiY = 0, roiW = 0, roiH = 0;
+            stabNode["roi_x"] >> roiX;
+            stabNode["roi_y"] >> roiY;
+            stabNode["roi_width"] >> roiW;
+            stabNode["roi_height"] >> roiH;
+            stabParams.roi = cv::Rect(roiX, roiY, roiW, roiH);
+        }
+        
+        // Horizon lock
+        stabNode["horizon_lock"] >> stabParams.horizonLock;
+        
+        // Feature detector selection
+        int featureDetectorType = 0; // Default to GFTT
+        stabNode["feature_detector_type"] >> featureDetectorType;
+        stabParams.featureDetector = static_cast<vs::Stabilizer::Parameters::FeatureDetector>(featureDetectorType);
+        stabNode["fast_threshold"] >> stabParams.fastThreshold;
+        stabNode["orb_features"] >> stabParams.orbFeatures;
+        
+        // Enhanced border effects
+        stabNode["border_scale_factor"] >> stabParams.borderScaleFactor;
+        stabNode["motion_threshold_low"] >> stabParams.motionThresholdLow;
+        stabNode["motion_threshold_high"] >> stabParams.motionThresholdHigh;
+        
+        // Fade parameters
+        stabNode["fadeDuration"] >> stabParams.fadeDuration;
+        stabNode["fadeAlpha"] >> stabParams.fadeAlpha;
+        
+        // Additional professional parameters (missing from previous config)
+        stabNode["use_imu_data"] >> stabParams.useImuData;
+        
+        // Virtual Canvas Stabilization parameters
+        stabNode["enable_virtual_canvas"] >> stabParams.enableVirtualCanvas;
+        stabNode["canvas_scale_factor"] >> stabParams.canvasScaleFactor;
+        stabNode["temporal_buffer_size"] >> stabParams.temporalBufferSize;
+        stabNode["canvas_blend_weight"] >> stabParams.canvasBlendWeight;
+        stabNode["adaptive_canvas_size"] >> stabParams.adaptiveCanvasSize;
+        stabNode["max_canvas_scale"] >> stabParams.maxCanvasScale;
+        stabNode["min_canvas_scale"] >> stabParams.minCanvasScale;
+        stabNode["preserve_edge_quality"] >> stabParams.preserveEdgeQuality;
+        stabNode["edge_blend_radius"] >> stabParams.edgeBlendRadius;
+        
+        // Professional motion classification thresholds
+        float shakeThreshold = 3.0f, walkingThreshold = 8.0f, vehicleThreshold = 15.0f;
+        stabNode["shake_level_threshold"] >> shakeThreshold;
+        stabNode["walking_detection_threshold"] >> walkingThreshold;
+        stabNode["vehicle_detection_threshold"] >> vehicleThreshold;
+        // Note: These are used internally by the stabilizer for motion classification
     }
 
     // Read Camera Parameters
@@ -938,8 +1028,6 @@ int main(int argc, char** argv) {
     std::cout << "Stabilizer: " << (runParams.stabilizationEnabled ? "Enabled" : "Disabled") << std::endl;
     std::cout << "Tracker: " << (runParams.trackerEnabled ? "Enabled" : "Disabled") << std::endl;
 
-    vs::Stabilizer stab(stabParams);
-
     // Control variables for runtime monitoring
     int emptyFrameCount = 0;
     int configCheckCounter = 0;
@@ -971,9 +1059,15 @@ int main(int argc, char** argv) {
     
     GStreamerPipelineManager pipelineManager(sourceAddress, outputAddress, bitrate);
     
-    // Set up frame processor function for the pipeline manager
+    // Create stabilizer as smart pointer so we can recreate it
+    std::unique_ptr<vs::Stabilizer> stab = std::make_unique<vs::Stabilizer>(stabParams);
+
+    // Set up frame processor to use the smart pointer
     pipelineManager.setFrameProcessor([&](const cv::Mat& frame) -> cv::Mat {
         cv::Mat processedFrame = frame.clone();
+        
+        // Debug counter to verify parameter usage
+        static int debugCounter = 0;
         
         try {
             // Apply processing steps based on configuration
@@ -986,9 +1080,16 @@ int main(int argc, char** argv) {
                 processedFrame = vs::RollCorrection::autoCorrectRoll(processedFrame, rollParams);
             }
 
-            // Apply Stabilization
-            if (runParams.stabilizationEnabled) {
-                cv::Mat stabilizedFrame = stab.stabilize(processedFrame);
+            // Apply Stabilization with current parameters
+            if (runParams.stabilizationEnabled && stab) {
+                // Debug output every 300 frames to verify current parameters
+                if ((debugCounter++ % 300) == 0) {
+                    std::cout << "🎯 Current stabilizer mode: " << stabParams.smoothingMethod 
+                              << ", radius: " << stabParams.smoothingRadius 
+                              << ", horizon_lock: " << (stabParams.horizonLock ? "ON" : "OFF") << std::endl;
+                }
+                
+                cv::Mat stabilizedFrame = stab->stabilize(processedFrame);
                 if (!stabilizedFrame.empty()) {
                     processedFrame = stabilizedFrame;
                 }
@@ -1012,7 +1113,6 @@ int main(int argc, char** argv) {
             }
         } catch (const std::exception& e) {
             std::cerr << "Frame processing error: " << e.what() << std::endl;
-            // Return original frame on error
             return frame.clone();
         }
         
@@ -1050,40 +1150,68 @@ int main(int argc, char** argv) {
     int loopCounter = 0;
     while (!stopRequested) {
         // Configuration file monitoring
-        if (loopCounter % 30 == 0) {  // Check every 30 loops
-            if (stat(configFile.c_str(), &configStat) == 0) {
-                if (configStat.st_mtime != lastConfigModTime) {
-                    std::cout << "\n=== Configuration file updated, reloading parameters... ===" << std::endl;
+if (loopCounter % 30 == 0) {  // Check every 30 loops
+    if (stat(configFile.c_str(), &configStat) == 0) {
+        if (configStat.st_mtime != lastConfigModTime) {
+            std::cout << "\n=== Configuration file updated, reloading parameters... ===" << std::endl;
+            
+            // Store old values
+            bool oldPassthrough = usePassthrough;
+            bool oldStabilizerEnabled = runParams.stabilizationEnabled;
+            
+            if (readConfig(configFile, videoSource, runParams, enhancerParams, rollParams, stabParams, camParams, trackerParams)) {
+                // Update processing mode
+                usePassthrough = !runParams.enhancerEnabled && 
+                               !runParams.rollCorrectionEnabled && 
+                               !runParams.stabilizationEnabled &&
+                               !runParams.trackerEnabled;
+                
+                // IMPORTANT: Recreate stabilizer with new parameters
+                if (runParams.stabilizationEnabled) {
+                    std::cout << "Recreating stabilizer with new parameters..." << std::endl;
+                    std::cout << "  - Smoothing radius: " << stabParams.smoothingRadius << std::endl;
+                    std::cout << "  - Smoothing method: " << stabParams.smoothingMethod << std::endl;
+                    std::cout << "  - Gaussian sigma: " << stabParams.gaussianSigma << std::endl;
+                    std::cout << "  - Intentional motion threshold: " << stabParams.intentionalMotionThreshold << std::endl;
+                    std::cout << "  - Horizon lock: " << (stabParams.horizonLock ? "Enabled" : "Disabled") << std::endl;
+                    std::cout << "  - Adaptive smoothing: " << (stabParams.adaptiveSmoothing ? "Enabled" : "Disabled") << std::endl;
                     
-                    // Store old values
-                    bool oldPassthrough = usePassthrough;
+                    // Clean up old stabilizer
+                    if (stab) {
+                        stab->clean();
+                    }
                     
-                    if (readConfig(configFile, videoSource, runParams, enhancerParams, rollParams, stabParams, camParams, trackerParams)) {
-                        // Update processing mode
-                        usePassthrough = !runParams.enhancerEnabled && 
-                                       !runParams.rollCorrectionEnabled && 
-                                       !runParams.stabilizationEnabled &&
-                                       !runParams.trackerEnabled;
-                        
-                        // Switch mode if needed - seamlessly!
-                        if (oldPassthrough != usePassthrough) {
-                            if (usePassthrough) {
-                                pipelineManager.switchToPassthrough();
-                                std::cout << "Seamlessly switched to PASSTHROUGH mode" << std::endl;
-                            } else {
-                                pipelineManager.switchToProcessing();
-                                std::cout << "Seamlessly switched to PROCESSING mode" << std::endl;
-                            }
-                        }
-                        
-                        lastConfigModTime = configStat.st_mtime;
-                        std::cout << "Configuration reloaded successfully!" << std::endl;
-                    } else {
-                        std::cerr << "Failed to reload configuration" << std::endl;
+                    // Create new stabilizer with updated parameters
+                    stab = std::make_unique<vs::Stabilizer>(stabParams);
+                    std::cout << "Stabilizer recreated successfully!" << std::endl;
+                } else if (oldStabilizerEnabled && !runParams.stabilizationEnabled) {
+                    // Stabilizer was disabled
+                    std::cout << "Stabilizer disabled, cleaning up..." << std::endl;
+                    if (stab) {
+                        stab->clean();
+                        stab.reset();
                     }
                 }
+                
+                // Switch mode if needed - seamlessly!
+                if (oldPassthrough != usePassthrough) {
+                    if (usePassthrough) {
+                        pipelineManager.switchToPassthrough();
+                        std::cout << "Seamlessly switched to PASSTHROUGH mode" << std::endl;
+                    } else {
+                        pipelineManager.switchToProcessing();
+                        std::cout << "Seamlessly switched to PROCESSING mode" << std::endl;
+                    }
+                }
+                
+                lastConfigModTime = configStat.st_mtime;
+                std::cout << "Configuration reloaded successfully!" << std::endl;
+            } else {
+                std::cerr << "Failed to reload configuration" << std::endl;
             }
         }
+    }
+}
 
         // Print performance stats occasionally
         if (loopCounter % 300 == 0) {  // Every 300 loops (~30 seconds)

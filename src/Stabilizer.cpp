@@ -83,7 +83,7 @@ namespace vs {
     Stabilizer::Stabilizer(const Parameters &params)
     : params_(params)
     {
-        if(params_.logging) logMessage("Initializing...");
+        if(params_.logging) logMessage("Initializing Jetson Orin Nano optimized stabilizer...");
 
         useGpu_ = params_.useCuda;
         borderMode_ = mapBorderMode(params_.borderType);
@@ -101,51 +101,117 @@ namespace vs {
             if(params_.logging) logMessage("Using fade border effect", false);
         }
 
-        // Optimized smoothing radius for performance
-        int effectiveRadius = std::max(3, std::min(params_.smoothingRadius, 15));
+        // Professional-grade stabilization parameters
+        int effectiveRadius = std::max(5, std::min(params_.smoothingRadius, 25));
         
-        // 1D box kernel - pre-allocated for efficiency
+        // Multi-stage smoothing kernels
         boxKernel_.resize(effectiveRadius, 1.0f / effectiveRadius);
         
-        // Pre-allocate vectors for better performance
-        transforms_.reserve(100);
-        path_.reserve(100);
-        smoothedPath_.reserve(100);
-        // Note: std::deque doesn't have reserve(), but it's still more efficient than std::vector for our use case
+        // Enhanced motion analysis buffers for professional-grade stabilization
+        transforms_.reserve(500);
+        path_.reserve(500);
+        smoothedPath_.reserve(500);
+        motionHistory_.reserve(100);  // For motion pattern analysis
+        intentionalMotionBuffer_.reserve(50);  // For intent detection
+        
+        // Initialize professional stabilization components
+        initializeRobustStabilization();
 
-        // CPU CLAHE with optimized parameters
-        claheCPU_ = cv::createCLAHE(1.5, cv::Size(8,8));  // Reduced clip limit for performance
-
+        // Jetson Orin Nano optimized initialization
+        // Skip CLAHE for real-time performance - use simple histogram equalization instead
+        
     #if defined(HAVE_OPENCV_CUDAARITHM) || defined(HAVE_OPENCV_CUDAWARPING)
         if(useGpu_) {
-            // GPU CLAHE
-            claheGPU_ = cv::cuda::createCLAHE(2.0, cv::Size(8,8));
+            // Create multiple CUDA streams for parallel processing
+            cudaStream_ = cv::cuda::Stream();  // Primary stream
+            analysisStream_ = cv::cuda::Stream();  // Analysis stream
+            warpStream_ = cv::cuda::Stream();  // Warping stream
+            
+            // Pre-allocate GPU memory buffers - increased sizes for 1920x1080 frames
+            gpuFrameBuffer_.create(2160, 3840, CV_8UC3);  // 4K max for safety
+            gpuGrayBuffer_.create(540, 960, CV_8UC1);     // Analysis resolution buffer
+            gpuPrevGrayBuffer_.create(540, 960, CV_8UC1);
+            gpuWarpBuffer_.create(2160, 3840, CV_8UC3);   // Match frame buffer
+            
+            if(params_.logging) logMessage("Jetson Orin Nano GPU optimization enabled with multi-stream processing");
+            
+            // Apply Jetson-specific optimizations
+            optimizeForJetson();
         }
-        cudaStream_ = cv::cuda::Stream::Null();
-
     #endif
 
     #ifdef HAVE_OPENCV_CUDAOPTFLOW
         if(useGpu_) {
-            // GPU SparsePyrLK
+            // Jetson optimized optical flow parameters
             pyrLK_ = cv::cuda::SparsePyrLKOpticalFlow::create();
-            pyrLK_->setWinSize(cv::Size(21,21));
-            pyrLK_->setMaxLevel(3);
-
+            pyrLK_->setWinSize(cv::Size(15,15));  // Reduced window size for speed
+            pyrLK_->setMaxLevel(2);               // Reduced pyramid levels
+            pyrLK_->setNumIters(20);              // Reduced iterations
+            
+            // Use Jetson-optimized GFTT parameters
     #ifdef HAVE_OPENCV_CUDAFEATURES2D
-            // GPU GFTT
             gfttDetector_ = cv::cuda::createGoodFeaturesToTrackDetector(
                 CV_8UC1, 
-                params_.maxCorners, 
-                params_.qualityLevel, 
-                params_.minDistance,
-                params_.blockSize,
-                false,  // useHarris
+                std::min(params_.maxCorners, 300),  // Limit features for real-time
+                0.02,     // Slightly lower quality for speed
+                10.0,     // Increased min distance
+                3,        // Smaller block size
+                false,    // useHarris = false (faster)
                 0.04
             );
     #endif
         }
     #endif
+    }
+
+    // Professional-grade stabilization system initialization (iPhone/GoPro-like)
+    void Stabilizer::initializeRobustStabilization() {
+        // Initialize motion prediction system
+        velocityFilter_.resize(5, 0.0f);  // Velocity smoothing
+        accelerationFilter_.resize(3, 0.0f);  // Acceleration smoothing
+        
+        // Horizon lock initialization
+        horizonLockEnabled_ = true;
+        horizonAngle_ = 0.0f;
+        horizonConfidence_ = 0.0f;
+        
+        // Motion analysis thresholds (iPhone/GoPro-like)
+        intentionalMotionThreshold_ = 15.0f;  // degrees/second
+        shakeLevelThreshold_ = 2.0f;  // pixels
+        
+        // Adaptive smoothing parameters
+        minSmoothingStrength_ = 0.3f;
+        maxSmoothingStrength_ = 0.95f;
+        
+        // Scene classification
+        lastSceneType_ = SceneType::NORMAL;
+        sceneChangeCounter_ = 0;
+        
+        // Initialize multi-frame motion model
+        frameCount_ = 0;
+        lastValidTransform_ = Transform();
+        
+        // Professional motion history tracking
+        motionQuality_ = 0.8f;
+        stabilizationStrength_ = 0.7f;
+        
+        // Initialize Virtual Canvas Stabilization if enabled
+        if (params_.enableVirtualCanvas) {
+            temporalFrameBuffer_.clear();
+            temporalTransformBuffer_.clear();
+            // Note: std::deque doesn't have reserve(), but that's okay - it will grow as needed
+            
+            currentCanvasScale_ = params_.canvasScaleFactor;
+            virtualCanvasFrameCount_ = 0;
+            
+            if(params_.logging) {
+                logMessage("Virtual Canvas Stabilization enabled - Canvas scale: " + 
+                          std::to_string(currentCanvasScale_) + 
+                          ", Buffer size: " + std::to_string(params_.temporalBufferSize), false);
+            }
+        }
+        
+        if(params_.logging) logMessage("Professional stabilization system initialized", false);
     }
 
     Stabilizer::~Stabilizer()
@@ -166,7 +232,15 @@ namespace vs {
 
     #ifdef HAVE_OPENCV_CUDAARITHM
         prevGrayGPU_.release();
-        if(claheGPU_) claheGPU_.release();
+        gpuFrameBuffer_.release();
+        gpuGrayBuffer_.release();
+        gpuPrevGrayBuffer_.release();
+        gpuWarpBuffer_.release();
+        
+        // Synchronize streams before cleanup - CUDA streams don't have empty() method
+        cudaStream_.waitForCompletion();
+        analysisStream_.waitForCompletion();
+        warpStream_.waitForCompletion();
     #endif
 
         prevKeypointsCPU_.clear();
@@ -196,25 +270,40 @@ namespace vs {
         }
 
         if(firstFrame_) {
-            // Initialize with first frame
+            // Initialize with first frame - optimized for Jetson Orin Nano
             frameWidth_ = frame.cols;
             frameHeight_ = frame.rows;
-            // Reduced analysis resolution for better performance on Jetson but not too aggressive
-            constexpr int ANALYSIS_W = 640, ANALYSIS_H = 360;  // Restored for better stability
-    double fx = static_cast<double>(ANALYSIS_W) / frame.cols;
-    double fy = static_cast<double>(ANALYSIS_H) / frame.rows;
-        cv::Mat firstSmall;
-    cv::resize(frame, firstSmall,
-               cv::Size(ANALYSIS_W, ANALYSIS_H),
-               0, 0, cv::INTER_AREA);  // INTER_AREA for better quality
-
-            // Convert to gray
+            
+            // Ultra-low latency analysis resolution for real-time performance
+            constexpr int ANALYSIS_W = 480, ANALYSIS_H = 270;  // Smaller for speed
+            
+            cv::Mat firstSmall;
             if(useGpu_) {
     #ifdef HAVE_OPENCV_CUDAARITHM
-                prevGrayGPU_ = convertColorAndEnhanceGPU(firstSmall);
+                // Ensure buffer is large enough for the frame
+                if(gpuFrameBuffer_.rows < frame.rows || gpuFrameBuffer_.cols < frame.cols) {
+                    gpuFrameBuffer_.create(std::max(frame.rows, 2160), std::max(frame.cols, 3840), CV_8UC3);
+                }
+                
+                // Upload to pre-allocated buffer with safe ROI
+                cv::cuda::GpuMat gpuFrame = gpuFrameBuffer_(cv::Rect(0, 0, frame.cols, frame.rows));
+                gpuFrame.upload(frame, analysisStream_);
+                
+                // Ensure analysis buffer is large enough
+                if(gpuGrayBuffer_.rows < ANALYSIS_H || gpuGrayBuffer_.cols < ANALYSIS_W) {
+                    gpuGrayBuffer_.create(std::max(ANALYSIS_H, 1080), std::max(ANALYSIS_W, 1920), CV_8UC1);
+                }
+                
+                // Fast resize and color conversion in one pass
+                cv::cuda::GpuMat gpuSmall = gpuGrayBuffer_(cv::Rect(0, 0, ANALYSIS_W, ANALYSIS_H));
+                cv::cuda::resize(gpuFrame, gpuSmall, cv::Size(ANALYSIS_W, ANALYSIS_H), 0, 0, cv::INTER_LINEAR, analysisStream_);
+                cv::cuda::cvtColor(gpuSmall, prevGrayGPU_, cv::COLOR_BGR2GRAY, 0, analysisStream_);
+                analysisStream_.waitForCompletion();
     #endif
             } else {
-                prevGrayCPU_ = convertColorAndEnhanceCPU(firstSmall);
+                // CPU path - simple and fast
+                cv::resize(frame, firstSmall, cv::Size(ANALYSIS_W, ANALYSIS_H), 0, 0, cv::INTER_LINEAR);
+                cv::cvtColor(firstSmall, prevGrayCPU_, cv::COLOR_BGR2GRAY);
             }
 
             // GFTT for the "prev" frame
@@ -292,7 +381,7 @@ namespace vs {
         generateTransform(frame);
 
         // Use effective smoothing radius for better performance
-        int effectiveRadius = std::max(3, std::min(params_.smoothingRadius, 15));
+        int effectiveRadius = std::max(5, std::min(params_.smoothingRadius, 35));
         if(frameIndexQueue_.size() < (size_t)effectiveRadius) {
             nextFrameIndex_++;
             return cv::Mat();
@@ -313,138 +402,221 @@ namespace vs {
 
     void Stabilizer::generateTransform(const cv::Mat &currFrameBGR)
     {
-    // Balanced analysis resolution - good stability with reasonable performance
-    constexpr int ANALYSIS_W = 640, ANALYSIS_H = 360;  // Restored for better stability
-    cv::Mat small;
-    cv::resize(currFrameBGR,              // full‑HD in
-               small,                     // 640×360 out
-               cv::Size(ANALYSIS_W, ANALYSIS_H),
-               0, 0, cv::INTER_AREA);     // INTER_AREA for better quality
-	analysisWidth_  = small.cols;   // 640
-	analysisHeight_ = small.rows;   // 360
-
-        // Convert current frame to Gray
-        cv::Mat currGrayCPU;
+    // Ultra-fast analysis resolution for Jetson Orin Nano real-time performance
+    constexpr int ANALYSIS_W = 480, ANALYSIS_H = 270;  // Reduced for speed
+    
+    // Convert current frame to Gray with minimal CPU-GPU transfers
+    cv::Mat currGrayCPU;
     #ifdef HAVE_OPENCV_CUDAARITHM
         cv::cuda::GpuMat currGrayGPU;
     #endif
 
         if(useGpu_) {
     #ifdef HAVE_OPENCV_CUDAARITHM
-            currGrayGPU = convertColorAndEnhanceGPU(small);
+            // Ensure buffer is large enough for the current frame
+            if(gpuFrameBuffer_.rows < currFrameBGR.rows || gpuFrameBuffer_.cols < currFrameBGR.cols) {
+                gpuFrameBuffer_.create(std::max(currFrameBGR.rows, 2160), std::max(currFrameBGR.cols, 3840), CV_8UC3);
+            }
+            
+            // Reuse pre-allocated buffers - zero allocation during runtime
+            cv::cuda::GpuMat gpuFrame = gpuFrameBuffer_(cv::Rect(0, 0, currFrameBGR.cols, currFrameBGR.rows));
+            gpuFrame.upload(currFrameBGR, analysisStream_);
+            
+            // Ensure analysis buffer is large enough
+            if(gpuGrayBuffer_.rows < ANALYSIS_H || gpuGrayBuffer_.cols < ANALYSIS_W) {
+                gpuGrayBuffer_.create(std::max(ANALYSIS_H, 1080), std::max(ANALYSIS_W, 1920), CV_8UC1);
+            }
+            
+            cv::cuda::GpuMat gpuSmall = gpuGrayBuffer_(cv::Rect(0, 0, ANALYSIS_W, ANALYSIS_H));
+            cv::cuda::resize(gpuFrame, gpuSmall, cv::Size(ANALYSIS_W, ANALYSIS_H), 0, 0, cv::INTER_LINEAR, analysisStream_);
+            cv::cuda::cvtColor(gpuSmall, currGrayGPU, cv::COLOR_BGR2GRAY, 0, analysisStream_);
+            // Don't wait here - let optical flow wait when needed
     #endif
         } else {
-            currGrayCPU = convertColorAndEnhanceCPU(small);
+            // CPU path - optimized with INTER_LINEAR for speed
+            cv::Mat small;
+            cv::resize(currFrameBGR, small, cv::Size(ANALYSIS_W, ANALYSIS_H), 0, 0, cv::INTER_LINEAR);
+            cv::cvtColor(small, currGrayCPU, cv::COLOR_BGR2GRAY);
         }
+        
+	analysisWidth_  = ANALYSIS_W;
+	analysisHeight_ = ANALYSIS_H;
 
-        // Optical flow
+        // Jetson Orin Nano optimized optical flow with safety checks
         if(useGpu_) {
     #ifdef HAVE_OPENCV_CUDAOPTFLOW
-            if(prevPtsGPU_.empty()) {
-                // no prev points => transform=0
+            if(prevPtsGPU_.empty() || prevPtsGPU_.cols == 0) {
                 transforms_.push_back(cv::Vec3f(0.f,0.f,0.f));
             }
             else {
+                // Synchronize analysis stream before optical flow
+                analysisStream_.waitForCompletion();
+                
+                // Safety check for GPU matrices
+                if(prevGrayGPU_.empty() || currGrayGPU.empty()) {
+                    if(params_.logging) {
+                        logMessage("Empty GPU gray matrices, skipping optical flow", true);
+                    }
+                    transforms_.push_back(cv::Vec3f(0.f,0.f,0.f));
+                    return;
+                }
+                
                 cv::cuda::GpuMat currPtsGPU, statusGPU, errGPU;
-                // calc
-                pyrLK_->calc(
-                    prevGrayGPU_,
-                    currGrayGPU,
-                    prevPtsGPU_,
-                    currPtsGPU,
-                    statusGPU,
-                    errGPU
-                );
-                // The output currPtsGPU is 1xN, CV_32FC2
-                // download to CPU
+                
+                try {
+                    // Use main CUDA stream for optical flow
+                    pyrLK_->calc(
+                        prevGrayGPU_,
+                        currGrayGPU,
+                        prevPtsGPU_,
+                        currPtsGPU,
+                        statusGPU,
+                        errGPU,
+                        cudaStream_
+                    );
+                } catch(const cv::Exception& e) {
+                    if(params_.logging) {
+                        logMessage("GPU optical flow failed: " + std::string(e.what()), true);
+                    }
+                    transforms_.push_back(cv::Vec3f(0.f,0.f,0.f));
+                    return;
+                }
+                
+                // Add safety checks for GPU memory operations
                 std::vector<cv::Point2f> currPointsCPU;
-                if(!currPtsGPU.empty()) {
-                    currPointsCPU.resize(currPtsGPU.cols);
-                    currPtsGPU.download(currPointsCPU);
-                }
                 std::vector<uchar> statusCPU;
-                if(!statusGPU.empty()) {
-                    statusCPU.resize(statusGPU.cols);
-                    statusGPU.download(statusCPU);
+                
+                if(!currPtsGPU.empty() && currPtsGPU.cols > 0) {
+                    try {
+                        currPointsCPU.resize(currPtsGPU.cols);
+                        currPtsGPU.download(currPointsCPU, cudaStream_);
+                    } catch(const cv::Exception& e) {
+                        if(params_.logging) {
+                            logMessage("GPU download failed for currPts: " + std::string(e.what()), true);
+                        }
+                        transforms_.push_back(cv::Vec3f(0.f,0.f,0.f));
+                        return;
+                    }
                 }
+                if(!statusGPU.empty() && statusGPU.cols > 0) {
+                    try {
+                        statusCPU.resize(statusGPU.cols);
+                        statusGPU.download(statusCPU, cudaStream_);
+                    } catch(const cv::Exception& e) {
+                        if(params_.logging) {
+                            logMessage("GPU download failed for status: " + std::string(e.what()), true);
+                        }
+                        transforms_.push_back(cv::Vec3f(0.f,0.f,0.f));
+                        return;
+                    }
+                }
+                
+                // Wait for downloads to complete
+                cudaStream_.waitForCompletion();
 
-                // filter
+                // Ultra-fast filtering - skip outlier rejection for real-time
                 std::vector<cv::Point2f> validPrev, validCurr;
-                for(size_t i=0; i<statusCPU.size(); i++){
-                    if(statusCPU[i]) {
+                validPrev.reserve(statusCPU.size() / 2);  // Pre-allocate
+                validCurr.reserve(statusCPU.size() / 2);
+                
+                // Add bounds checking to prevent segfault
+                size_t minSize = std::min({statusCPU.size(), prevKeypointsCPU_.size(), currPointsCPU.size()});
+                for(size_t i=0; i<minSize; i++){
+                    if(i < statusCPU.size() && statusCPU[i] && 
+                       i < prevKeypointsCPU_.size() && i < currPointsCPU.size()) {
                         validPrev.push_back(prevKeypointsCPU_[i]);
                         validCurr.push_back(currPointsCPU[i]);
                     }
                 }
                 
-                // Apply SightLine-inspired outlier rejection - simplified for performance
-                if (params_.outlierRejection && validPrev.size() > 15) {  // Increased threshold
-                    filterOutliers(validPrev, validCurr);
-                }
-                
-                // estimate affine transform
-                cv::Mat T = cv::Mat::eye(2,3,CV_64F);
-                if(validPrev.size() >= 6 && validCurr.size() >= 6) {  // Need minimum 6 points
-                    cv::Mat affine = cv::estimateAffinePartial2D(validPrev, validCurr, cv::noArray(), cv::RANSAC, 3.0);
-                    if(!affine.empty()) {
-                        T = affine;
+                // Fast affine estimation with safety checks
+                cv::Mat T = cv::Mat::eye(2,3,CV_32F);
+                if(validPrev.size() >= 4 && validCurr.size() >= 4 && validPrev.size() == validCurr.size()) {
+                    try {
+                        cv::Mat affine = cv::estimateAffinePartial2D(validPrev, validCurr, 
+                                                                   cv::noArray(), cv::RANSAC, 
+                                                                   5.0, 500);  // Reduced iterations
+                        if(!affine.empty() && affine.rows == 2 && affine.cols == 3) {
+                            affine.convertTo(T, CV_32F);
+                        }
+                    } catch(const cv::Exception& e) {
+                        if(params_.logging) {
+                            logMessage("Affine estimation failed: " + std::string(e.what()), true);
+                        }
+                        // T remains as identity matrix
                     }
                 }
-                double dx = T.at<double>(0,2);
-                double dy = T.at<double>(1,2);
-                double da = std::atan2(T.at<double>(1,0), T.at<double>(0,0));
+                float dx = T.at<float>(0,2);
+                float dy = T.at<float>(1,2);
+                float da = std::atan2(T.at<float>(1,0), T.at<float>(0,0));
                 
-                // Skip horizon lock for performance unless specifically enabled
-                if (params_.horizonLock) {
-                    da = 0.0;
-                }
-                
-                transforms_.push_back(cv::Vec3f((float)dx,(float)dy,(float)da));
+                transforms_.push_back(cv::Vec3f(dx, dy, da));
             }
     #endif
         }
         else {
-            // CPU Optical flow
-            if(!prevKeypointsCPU_.empty()) {
+            // CPU Optical flow - optimized for speed with safety checks
+            if(!prevKeypointsCPU_.empty() && !prevGrayCPU_.empty() && !currGrayCPU.empty()) {
                 std::vector<cv::Point2f> tmpCurr;
                 std::vector<uchar> status;
                 std::vector<float> err;
-                cv::calcOpticalFlowPyrLK(
-                    prevGrayCPU_, currGrayCPU,
-                    prevKeypointsCPU_,
-                    tmpCurr,
-                    status, err
-                );
+                
+                try {
+                    // Optimized LK parameters for speed
+                    cv::calcOpticalFlowPyrLK(
+                        prevGrayCPU_, currGrayCPU,
+                        prevKeypointsCPU_,
+                        tmpCurr,
+                        status, err,
+                        cv::Size(15,15),  // Reduced window size
+                        2,                // Reduced pyramid levels
+                        cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS, 20, 0.03)
+                    );
+                } catch(const cv::Exception& e) {
+                    if(params_.logging) {
+                        logMessage("CPU optical flow failed: " + std::string(e.what()), true);
+                    }
+                    transforms_.push_back(cv::Vec3f(0.f,0.f,0.f));
+                    return;
+                }
+                
+                // Fast filtering - pre-allocate for speed
                 std::vector<cv::Point2f> validPrev, validCurr;
-                for(size_t i=0; i<status.size(); i++) {
-                    if(status[i]) {
+                validPrev.reserve(status.size() / 2);
+                validCurr.reserve(status.size() / 2);
+                
+                // Add bounds checking to prevent segfault
+                size_t minSize = std::min({status.size(), prevKeypointsCPU_.size(), tmpCurr.size()});
+                for(size_t i=0; i<minSize; i++) {
+                    if(i < status.size() && status[i] && 
+                       i < prevKeypointsCPU_.size() && i < tmpCurr.size()) {
                         validPrev.push_back(prevKeypointsCPU_[i]);
                         validCurr.push_back(tmpCurr[i]);
                     }
                 }
                 
-                // Apply SightLine-inspired outlier rejection - simplified for performance
-                if (params_.outlierRejection && validPrev.size() > 15) {  // Increased threshold
-                    filterOutliers(validPrev, validCurr);
-                }
-                
-                cv::Mat T = cv::Mat::eye(2,3,CV_64F);
-                if(validPrev.size() >= 6 && validCurr.size() >= 6) {  // Need minimum 6 points
-                    cv::Mat affine = cv::estimateAffinePartial2D(validPrev, validCurr, cv::noArray(), cv::RANSAC, 3.0);
-                    if(!affine.empty()) {
-                        T = affine;
+                // Fast affine estimation with safety checks
+                cv::Mat T = cv::Mat::eye(2,3,CV_32F);
+                if(validPrev.size() >= 4 && validCurr.size() >= 4 && validPrev.size() == validCurr.size()) {
+                    try {
+                        cv::Mat affine = cv::estimateAffinePartial2D(validPrev, validCurr, 
+                                                                   cv::noArray(), cv::RANSAC, 
+                                                                   5.0, 500);
+                        if(!affine.empty() && affine.rows == 2 && affine.cols == 3) {
+                            affine.convertTo(T, CV_32F);
+                        }
+                    } catch(const cv::Exception& e) {
+                        if(params_.logging) {
+                            logMessage("CPU affine estimation failed: " + std::string(e.what()), true);
+                        }
+                        // T remains as identity matrix
                     }
                 }
-                double dx = T.at<double>(0,2);
-                double dy = T.at<double>(1,2);
-                double da = std::atan2(T.at<double>(1,0), T.at<double>(0,0));
+                float dx = T.at<float>(0,2);
+                float dy = T.at<float>(1,2);
+                float da = std::atan2(T.at<float>(1,0), T.at<float>(0,0));
                 
-                // Skip horizon lock for performance unless specifically enabled
-                if (params_.horizonLock) {
-                    da = 0.0;
-                }
-                
-                transforms_.push_back(cv::Vec3f((float)dx,(float)dy,(float)da));
+                transforms_.push_back(cv::Vec3f(dx, dy, da));
             }
             else {
                 transforms_.push_back(cv::Vec3f(0.f,0.f,0.f));
@@ -462,44 +634,59 @@ namespace vs {
         smoothedPath_ = path_;
         
         // Skip adaptive parameters for performance - disabled by default in config
-        // if (params_.adaptiveSmoothing) {
-        //     updateAdaptiveParameters();
-        // }
+        if (params_.adaptiveSmoothing) {
+            updateAdaptiveParameters();
+        }
 
-        // Now detect features on current for next iteration
-        if(useGpu_) {
+        // Optimized feature detection for next iteration - reduced frequency for speed
+        static int featureDetectionCounter = 0;
+        if((++featureDetectionCounter % 2) == 0) {  // Detect features every 2nd frame for speed
+            if(useGpu_) {
     #ifdef HAVE_OPENCV_CUDAARITHM
-            cv::cuda::GpuMat currGray = currGrayGPU;
+                cv::cuda::GpuMat currGray = currGrayGPU;
     #ifdef HAVE_OPENCV_CUDAFEATURES2D
-            if(gfttDetector_) {
-                // Use enhanced GPU feature detection
-                cv::cuda::GpuMat cornersGPU = detectFeaturesGPU(currGray);
-                
-                // If valid corners detected
-                if(!cornersGPU.empty()) {
-                    std::vector<cv::Point2f> cornersCPU(cornersGPU.cols);
-                    cornersGPU.download(cornersCPU);
-
-                    prevKeypointsCPU_ = cornersCPU;
+                if(gfttDetector_) {
+                    cv::cuda::GpuMat cornersGPU;
+                    
+                    // Use analysis stream for feature detection
+                    gfttDetector_->detect(currGray, cornersGPU, cv::noArray(), analysisStream_);
+                    
+                    if(!cornersGPU.empty()) {
+                        cornersGPU = cornersGPU.reshape(2, 1);  // Reshape to 1xN
+                        
+                        std::vector<cv::Point2f> cornersCPU(cornersGPU.cols);
+                        cornersGPU.download(cornersCPU, analysisStream_);
+                        
+                        // Wait for download to complete
+                        analysisStream_.waitForCompletion();
+                        
+                        prevKeypointsCPU_ = cornersCPU;
     #ifdef HAVE_OPENCV_CUDAOPTFLOW
-                    if(!cornersCPU.empty()) {
-                        cv::Mat ptsMat(1, (int)cornersCPU.size(), CV_32FC2, (void*)cornersCPU.data());
-                        prevPtsGPU_.upload(ptsMat);
+                        if(!cornersCPU.empty()) {
+                            cv::Mat ptsMat(1, (int)cornersCPU.size(), CV_32FC2, (void*)cornersCPU.data());
+                            prevPtsGPU_.upload(ptsMat, analysisStream_);
+                        } else {
+                            prevPtsGPU_.release();
+                        }
+    #endif
                     } else {
+                        prevKeypointsCPU_.clear();
                         prevPtsGPU_.release();
                     }
-    #endif
-                } else {
-                    prevKeypointsCPU_.clear();
-                    prevPtsGPU_.release();
                 }
+    #endif
+    #endif
             }
-    #endif
-    #endif
-        }
-        else {
-            // Use enhanced CPU feature detection
-            prevKeypointsCPU_ = detectFeatures(currGrayCPU);
+            else {
+                // Fast CPU feature detection - reduced parameters
+                std::vector<cv::Point2f> corners;
+                cv::goodFeaturesToTrack(currGrayCPU, corners,
+                    std::min(params_.maxCorners, 200),  // Limit features
+                    0.02,     // Lower quality threshold for speed
+                    15.0,     // Larger min distance
+                    cv::noArray(), 3);  // Smaller block size
+                prevKeypointsCPU_ = corners;
+            }
         }
 
         // Update prevGray
@@ -526,7 +713,12 @@ namespace vs {
         frameQueue_.pop_front();
         frameIndexQueue_.pop_front();
 
-        if((size_t)oldestIdx >= transforms_.size()) {
+        // Add bounds checking for oldestIdx to prevent segfault
+        if((size_t)oldestIdx >= transforms_.size() || (size_t)oldestIdx >= path_.size() || 
+           (size_t)oldestIdx >= smoothedPath_.size()) {
+            if(params_.logging) {
+                logMessage("Index out of bounds in applyNextSmoothTransform, returning original frame", true);
+            }
             return oldestFrame;
         }
 
@@ -541,43 +733,100 @@ namespace vs {
             pa.push_back(v[2]);
         }
         
-        // Apply the selected smoothing method - optimized for performance
+        // Professional multi-frame smoothing (iPhone/GoPro-like)
         std::vector<float> sx, sy, sa;
-        if (params_.smoothingMethod == "gaussian") {
-            // Apply Gaussian smoothing only if explicitly requested
+        
+        // Enhanced smoothing with motion-aware algorithms
+        if(params_.smoothingMethod == "gaussian") {
+            // Gaussian smoothing for high-quality results
             sx = gaussianFilterConvolve(px, params_.gaussianSigma);
             sy = gaussianFilterConvolve(py, params_.gaussianSigma);
             sa = gaussianFilterConvolve(pa, params_.gaussianSigma);
-        }
-        else {
-            // Default to box filter smoothing - most efficient for real-time
+        } else if(params_.smoothingMethod == "kalman") {
+            // Kalman filter for predictive smoothing
+            sx = kalmanFilterSmooth(px);
+            sy = kalmanFilterSmooth(py);
+            sa = kalmanFilterSmooth(pa);
+        } else {
+            // Enhanced box filter with adaptive radius
+            int adaptiveRadius = calculateAdaptiveRadius(px, py, pa);
+            
+            // Temporarily update radius for adaptive smoothing
+            int originalRadius = params_.smoothingRadius;
+            params_.smoothingRadius = adaptiveRadius;
+            boxKernel_.resize(params_.smoothingRadius, 1.0f / params_.smoothingRadius);
+            
             sx = boxFilterConvolve(px);
             sy = boxFilterConvolve(py);
             sa = boxFilterConvolve(pa);
+            
+            // Restore original radius
+            params_.smoothingRadius = originalRadius;
+            boxKernel_.resize(params_.smoothingRadius, 1.0f / params_.smoothingRadius);
+        }
+
+        // Add safety checks for smoothedPath size to prevent segfault
+        if(smoothedPath_.size() != path_.size() || smoothedPath_.size() <= (size_t)oldestIdx) {
+            if(params_.logging) {
+                logMessage("SmoothedPath size mismatch, rebuilding...", true);
+            }
+            smoothedPath_.resize(path_.size());
+            for(size_t i=0; i<path_.size() && i<sx.size() && i<sy.size() && i<sa.size(); i++) {
+                smoothedPath_[i] = cv::Vec3f(sx[i], sy[i], sa[i]);
+            }
         }
 
         smoothedPath_.resize(path_.size());
-        for(size_t i=0; i<path_.size(); i++) {
+        for(size_t i=0; i<path_.size() && i<sx.size() && i<sy.size() && i<sa.size(); i++) {
             smoothedPath_[i] = cv::Vec3f(sx[i], sy[i], sa[i]);
         }
 
-        // Apply motion prediction for better stability
+        // Professional motion analysis and prediction with bounds checking
+        if((size_t)oldestIdx >= transforms_.size() || (size_t)oldestIdx >= path_.size() || 
+           (size_t)oldestIdx >= smoothedPath_.size()) {
+            if(params_.logging) {
+                logMessage("Invalid index for motion analysis, using safe fallback", true);
+            }
+            return oldestFrame;
+        }
+        
         cv::Vec3f raw = transforms_[oldestIdx];
         cv::Vec3f diff = smoothedPath_[oldestIdx] - path_[oldestIdx];
         
-        if (params_.motionPrediction && oldestIdx > 0) {
-            // Check if the current motion is intentional or not
-            bool intentional = isIntentionalMotion(raw);
+        // Advanced motion intent detection (like iPhone Action mode)
+        if (oldestIdx > 0) {
+            MotionIntent intent = analyzeMotionIntent(raw, oldestIdx);
+            float adaptiveStrength = calculateAdaptiveStabilizationStrength(intent, raw);
             
-            if (intentional) {
-                // For intentional motion, reduce smoothing effect to be more responsive
-                diff *= 0.7f;  // Apply 70% of the correction for intentional motion
-                if (params_.logging) {
-                    logMessage("Motion determined to be intentional - reducing stabilization effect");
-                }
-            } else {
-                // For unintentional motion (camera shake), apply full stabilization
-                diff *= 1.0f;  // Apply full correction
+            switch(intent) {
+                case MotionIntent::DELIBERATE_PAN:
+                    // Minimal correction for intentional camera movement
+                    diff *= 0.5f;
+                    if (params_.logging) {
+                        logMessage("Deliberate panning detected - preserving motion", false);
+                    }
+                    break;
+                    
+                case MotionIntent::SHAKE_REMOVAL:
+                    // Strong correction for camera shake
+                    diff *= 1.0f;
+                    if (params_.logging) {
+                        logMessage("Camera shake detected - applying strong stabilization", false);
+                    }
+                    break;
+                    
+                case MotionIntent::FOLLOW_ACTION:
+                    // Balanced correction for action following
+                    diff *= 0.8f;
+                    if (params_.logging) {
+                        logMessage("Action following detected - balanced stabilization", false);
+                    }
+                    break;
+                    
+                default:
+                    // Adaptive correction based on motion quality
+                    diff *= adaptiveStrength;
+                    break;
             }
         }
         
@@ -684,40 +933,80 @@ blendedBorder.copyTo(frameWithBorder, borderMask);
             }
         }
 
-        // Warp the frame using the transformation matrix
+        // Jetson Orin Nano optimized warping with hardware acceleration and safety checks
         cv::Mat stabilized;
         if(useGpu_) {
     #if defined(HAVE_OPENCV_CUDAARITHM) || defined(HAVE_OPENCV_CUDAWARPING)
-            cv::cuda::GpuMat gpuIn, gpuOut;
-            gpuIn.upload(frameWithBorder, cudaStream_);
-            
-            // For fade border, use BORDER_CONSTANT
-            int actualBorderMode = (params_.borderType == "fade") ? cv::BORDER_CONSTANT : borderMode_;
-            
-            cv::cuda::warpAffine(
-                gpuIn, gpuOut, T, gpuIn.size(),
-                cv::INTER_LINEAR, actualBorderMode, cv::Scalar(), cudaStream_
-            );
-            gpuOut.download(stabilized, cudaStream_);
-            cudaStream_.waitForCompletion();
+            try {
+                // Safety check for input frame
+                if(frameWithBorder.empty()) {
+                    if(params_.logging) {
+                        logMessage("Empty frame for GPU warping, returning original", true);
+                    }
+                    return oldestFrame;
+                }
+                
+                // Ensure warp buffer is large enough
+                if(gpuWarpBuffer_.rows < frameWithBorder.rows || gpuWarpBuffer_.cols < frameWithBorder.cols) {
+                    gpuWarpBuffer_.create(std::max(frameWithBorder.rows, 2160), std::max(frameWithBorder.cols, 3840), CV_8UC3);
+                }
+                
+                // Ensure frame buffer is large enough
+                if(gpuFrameBuffer_.rows < frameWithBorder.rows || gpuFrameBuffer_.cols < frameWithBorder.cols) {
+                    gpuFrameBuffer_.create(std::max(frameWithBorder.rows, 2160), std::max(frameWithBorder.cols, 3840), CV_8UC3);
+                }
+                
+                // Use pre-allocated GPU buffers for zero-copy operation
+                cv::cuda::GpuMat gpuIn = gpuWarpBuffer_(cv::Rect(0, 0, frameWithBorder.cols, frameWithBorder.rows));
+                cv::cuda::GpuMat gpuOut = gpuFrameBuffer_(cv::Rect(0, 0, frameWithBorder.cols, frameWithBorder.rows));
+                
+                // Upload using warp stream for parallel processing
+                gpuIn.upload(frameWithBorder, warpStream_);
+                
+                // Hardware-accelerated warping
+                cv::cuda::warpAffine(
+                    gpuIn, gpuOut, T, gpuIn.size(),
+                    cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(), warpStream_
+                );
+                
+                // Download result
+                gpuOut.download(stabilized, warpStream_);
+                warpStream_.waitForCompletion();
+            } catch(const cv::Exception& e) {
+                if(params_.logging) {
+                    logMessage("GPU warping failed: " + std::string(e.what()) + ", falling back to CPU", true);
+                }
+                // Fallback to CPU warping
+                cv::warpAffine(frameWithBorder, stabilized, T, frameWithBorder.size(), cv::INTER_LINEAR, cv::BORDER_CONSTANT);
+            }
     #else
-            // fallback CPU
-            int actualBorderMode = (params_.borderType == "fade") ? cv::BORDER_CONSTANT : borderMode_;
-            
+            // CPU fallback with optimized parameters
             cv::warpAffine(
                 frameWithBorder, stabilized,
                 T, frameWithBorder.size(),
-                cv::INTER_LINEAR, actualBorderMode
+                cv::INTER_LINEAR, cv::BORDER_CONSTANT
             );
     #endif
         } else {
-            int actualBorderMode = (params_.borderType == "fade") ? cv::BORDER_CONSTANT : borderMode_;
-            
-            cv::warpAffine(
-                frameWithBorder, stabilized,
-                T, frameWithBorder.size(),
-                cv::INTER_LINEAR, actualBorderMode
-            );
+            // Optimized CPU warping with safety checks
+            try {
+                if(frameWithBorder.empty()) {
+                    if(params_.logging) {
+                        logMessage("Empty frame for CPU warping, returning original", true);
+                    }
+                    return oldestFrame;
+                }
+                cv::warpAffine(
+                    frameWithBorder, stabilized,
+                    T, frameWithBorder.size(),
+                    cv::INTER_LINEAR, cv::BORDER_CONSTANT
+                );
+            } catch(const cv::Exception& e) {
+                if(params_.logging) {
+                    logMessage("CPU warping failed: " + std::string(e.what()) + ", returning original frame", true);
+                }
+                return oldestFrame;
+            }
         }
         
         // Update the border history for fade effect
@@ -781,6 +1070,13 @@ if (params_.cropNZoom && params_.borderSize > 0)
             return stabilized;
         }
 
+        // Apply Virtual Canvas Stabilization if enabled
+        if (params_.enableVirtualCanvas) {
+            cv::Vec3f currentTransform(dx, dy, da);
+            updateTemporalFrameBuffer(oldestFrame, currentTransform);
+            stabilized = applyVirtualCanvasStabilization(oldestFrame, currentTransform);
+        }
+
         return stabilized;
     }
 
@@ -788,70 +1084,51 @@ std::vector<float> Stabilizer::boxFilterConvolve(const std::vector<float> &path)
 {
     if(path.empty()) return {};
     
-    // Use proper smoothing radius for stability
-    int r = std::max(5, std::min(params_.smoothingRadius, 50));  // Allow larger radius for stability
+    // Jetson Orin Nano optimized smoothing - reduced radius for speed
+    int r = std::max(2, std::min(params_.smoothingRadius, 8));  // Much smaller radius
 
-    if(path.size() <= r) {
-        // For very small arrays, use mean
-        float sum = std::accumulate(path.begin(), path.end(), 0.0f);
-        float mean = sum / path.size();
-        std::vector<float> result(path.size(), mean);
-        return result;
+    if(path.size() <= static_cast<size_t>(r)) {
+        return path;  // Return original if too small
     }
     
-    // Use proper padding for better edge handling
-    std::vector<float> padded(path.size() + 2*r);
-    
-    // Pad with edge values (replicate border)
-    for(int i = 0; i < r; i++) {
-        padded[i] = path[0];  // Left padding
-        padded[padded.size() - 1 - i] = path[path.size() - 1];  // Right padding
-    }
-    
-    // Copy original data
-    for(size_t i = 0; i < path.size(); i++) {
-        padded[i + r] = path[i];
-    }
-    
-    // Apply box filter with proper normalization
+    // Simplified padding for speed
     std::vector<float> result(path.size());
-    int kernelSize = 2 * r + 1;
     
+    // Fast box filter without padding - edge effects acceptable for real-time
     for(size_t i = 0; i < path.size(); i++) {
         float sum = 0.0f;
-        for(int j = 0; j < kernelSize; j++) {
-            sum += padded[i + j];
+        int count = 0;
+        
+        int start = std::max(0, static_cast<int>(i) - r);
+        int end = std::min(static_cast<int>(path.size()) - 1, static_cast<int>(i) + r);
+        
+        for(int j = start; j <= end; j++) {
+            sum += path[j];
+            count++;
         }
-        result[i] = sum / kernelSize;
+        
+        result[i] = sum / count;
     }
     
     return result;
 }
 
-    // CPU color + CLAHE
+    // Ultra-fast color conversion for Jetson Orin Nano - no enhancement
     cv::Mat Stabilizer::convertColorAndEnhanceCPU(const cv::Mat &frameBGR)
     {
         cv::Mat gray;
         cv::cvtColor(frameBGR, gray, cv::COLOR_BGR2GRAY);
-        cv::Mat eq;
-        claheCPU_->apply(gray, eq);
-        return eq;
+        return gray;  // Skip CLAHE for real-time performance
     }
 
     #ifdef HAVE_OPENCV_CUDAARITHM
-    // GPU color + CLAHE
+    // Ultra-fast GPU color conversion - no enhancement
     cv::cuda::GpuMat Stabilizer::convertColorAndEnhanceGPU(const cv::Mat &frameBGR)
     {
-        cv::cuda::GpuMat gpuIn, gpuGray, gpuCLAHE;
-        gpuIn.upload(frameBGR, cudaStream_);
-        cv::cuda::cvtColor(gpuIn, gpuGray, cv::COLOR_BGR2GRAY, 0, cudaStream_);
-        if(claheGPU_) {
-            claheGPU_->apply(gpuGray, gpuCLAHE);
-        } else {
-            gpuCLAHE = gpuGray;
-        }
-        cudaStream_.waitForCompletion();
-        return gpuCLAHE;
+        cv::cuda::GpuMat gpuIn, gpuGray;
+        gpuIn.upload(frameBGR);
+        cv::cuda::cvtColor(gpuIn, gpuGray, cv::COLOR_BGR2GRAY);
+        return gpuGray;  // Skip CLAHE for real-time performance
     }
     #endif
 
@@ -1303,142 +1580,390 @@ else {
             a1 = adaptiveFrequencyFilter(a1);
         }
         
-        // Stage 3: Second pass smoothing with stageTwoRadius for extra stability
-        if (params_.smoothingMethod == "gaussian") {
-            // Use stronger smoothing for the second pass
-            double sigma2 = params_.gaussianSigma * 1.5;
-            x = gaussianFilterConvolve(x1, sigma2);
-            y = gaussianFilterConvolve(y1, sigma2);
-            a = gaussianFilterConvolve(a1, sigma2);
-        } 
-        else if (params_.smoothingMethod == "kalman") {
-            // For Kalman, just apply a second pass
-            x = kalmanFilterSmooth(x1);
-            y = kalmanFilterSmooth(y1);
-            a = kalmanFilterSmooth(a1);
-        }
-        else {
-            // Use stage two radius for second pass with box filter
-            int originalRadius = params_.smoothingRadius;
-            params_.smoothingRadius = params_.stageTwoRadius;
-            boxKernel_.resize(params_.smoothingRadius, 1.0f / params_.smoothingRadius);
-            
-            x = boxFilterConvolve(x1);
-            y = boxFilterConvolve(y1);
-            a = boxFilterConvolve(a1);
-            
-            // Restore
-            params_.smoothingRadius = originalRadius;
-            boxKernel_.resize(params_.smoothingRadius, 1.0f / params_.smoothingRadius);
-        }
-        
-        // Stage 4: Apply temporal filtering if enabled
-        if (params_.useTemporalFiltering) {
-            x = temporalFilter(x);
-            y = temporalFilter(y);
-            a = temporalFilter(a);
-        }
+        // Update the input vectors with smoothed results
+        x = x1;
+        y = y1;
+        a = a1;
     }
-    
-    // Temporal filtering across multiple frames for even smoother results
-    std::vector<float> Stabilizer::temporalFilter(const std::vector<float> &path)
-    {
-        static std::deque<std::vector<float>> pathHistory;
+
+    // Professional adaptive radius calculation
+    int Stabilizer::calculateAdaptiveRadius(const std::vector<float>& px, const std::vector<float>& py, const std::vector<float>& pa) {
+        if(px.size() < 10) return params_.smoothingRadius;
         
-        // Store the current path in history
-        pathHistory.push_back(path);
+        // Calculate motion variance over recent frames
+        float varianceX = 0, varianceY = 0, varianceA = 0;
+        float meanX = 0, meanY = 0, meanA = 0;
         
-        // Keep history limited to window size
-        while (pathHistory.size() > static_cast<size_t>(params_.temporalWindowSize)) {
-            pathHistory.pop_front();
+        size_t start = std::max(0, static_cast<int>(px.size()) - 20);
+        size_t count = px.size() - start;
+        
+        // Calculate means
+        for(size_t i = start; i < px.size(); i++) {
+            meanX += px[i];
+            meanY += py[i];
+            meanA += pa[i];
         }
+        meanX /= count;
+        meanY /= count;
+        meanA /= count;
         
-        // If we don't have enough history, return original path
-        if (pathHistory.size() < 3) {
-            return path;
+        // Calculate variances
+        for(size_t i = start; i < px.size(); i++) {
+            varianceX += (px[i] - meanX) * (px[i] - meanX);
+            varianceY += (py[i] - meanY) * (py[i] - meanY);
+            varianceA += (pa[i] - meanA) * (pa[i] - meanA);
         }
+        varianceX /= count;
+        varianceY /= count;
+        varianceA /= count;
         
-        // Apply temporal median filtering
-        std::vector<float> result(path.size());
+        float totalVariance = std::sqrt(varianceX + varianceY + varianceA * 1000); // Scale rotation
         
-        for (size_t i = 0; i < path.size(); i++) {
-            std::vector<float> values;
-            values.reserve(pathHistory.size());
+        // Map variance to radius: high variance = high radius (more smoothing)
+        int adaptiveRadius = static_cast<int>(std::max(5.0f, std::min(25.0f, totalVariance * 2.0f)));
+        
+        return adaptiveRadius;
+    }
+
+    // Advanced motion intent analysis (iPhone Action mode-like)
+    MotionIntent Stabilizer::analyzeMotionIntent(const cv::Vec3f& motion, int frameIndex) {
+        float magnitude = std::sqrt(motion[0] * motion[0] + motion[1] * motion[1]);
+        float angularVel = std::abs(motion[2]) * 180.0f / M_PI * 30.0f; // Convert to deg/sec
+        
+        // Analyze motion pattern over recent frames
+        if(transforms_.size() >= 15) {
+            std::vector<float> recentMagnitudes;
+            std::vector<float> recentDirections;
             
-            for (const auto &historicalPath : pathHistory) {
-                if (i < historicalPath.size()) {
-                    values.push_back(historicalPath[i]);
+            for(int i = std::max(0, frameIndex - 15); i < frameIndex; i++) {
+                if(i < static_cast<int>(transforms_.size())) {
+                    cv::Vec3f t = transforms_[i];
+                    float mag = std::sqrt(t[0] * t[0] + t[1] * t[1]);
+                    float dir = std::atan2(t[1], t[0]);
+                    
+                    recentMagnitudes.push_back(mag);
+                    recentDirections.push_back(dir);
                 }
             }
             
-            if (!values.empty()) {
-                // Sort and get median value
-                std::sort(values.begin(), values.end());
-                size_t mid = values.size() / 2;
+            if(!recentMagnitudes.empty()) {
+                // Check for consistent direction (panning)
+                float directionVariance = calculateVariance(recentDirections);
+                float magnitudeConsistency = calculateConsistency(recentMagnitudes);
                 
-                if (values.size() % 2 == 0) {
-                    // Average of two middle values
-                    result[i] = (values[mid-1] + values[mid]) / 2.0f;
-                } else {
-                    // Exact middle value
-                    result[i] = values[mid];
+                // Deliberate panning: consistent direction and magnitude
+                if(directionVariance < 0.5f && magnitudeConsistency > 0.7f && magnitude > 5.0f) {
+                    return MotionIntent::DELIBERATE_PAN;
                 }
-            } else {
-                result[i] = path[i];
+                
+                // Shake: high frequency, low consistency
+                if(magnitude < 3.0f && magnitudeConsistency < 0.3f && angularVel > 10.0f) {
+                    return MotionIntent::SHAKE_REMOVAL;
+                }
+                
+                // Action following: medium magnitude, variable direction
+                if(magnitude > 3.0f && magnitude < 15.0f && directionVariance > 0.5f) {
+                    return MotionIntent::FOLLOW_ACTION;
+                }
             }
         }
         
-        return result;
+        return MotionIntent::NORMAL;
     }
-    
-    // Dynamically determine optimal border size based on motion magnitude
-    float Stabilizer::calculateDynamicBorderSize(const std::vector<cv::Vec3f> &recentTransforms)
-    {
-        if (recentTransforms.empty()) {
-            return static_cast<float>(params_.borderSize);
+
+    // Calculate adaptive stabilization strength
+    float Stabilizer::calculateAdaptiveStabilizationStrength(MotionIntent intent, const cv::Vec3f& motion) {
+        float baseMagnitude = std::sqrt(motion[0] * motion[0] + motion[1] * motion[1]);
+        
+        // Base strength calculation
+        float strength = 0.7f; // Default
+        
+        switch(intent) {
+            case MotionIntent::DELIBERATE_PAN:
+                strength = 0.1f + (baseMagnitude / 50.0f) * 0.2f; // Very light for panning
+                break;
+                
+            case MotionIntent::SHAKE_REMOVAL:
+                strength = 0.9f - (baseMagnitude / 10.0f) * 0.2f; // Strong for shake
+                break;
+                
+            case MotionIntent::FOLLOW_ACTION:
+                strength = 0.6f + (baseMagnitude / 20.0f) * 0.2f; // Balanced for action
+                break;
+                
+            default:
+                strength = 0.7f; // Standard stabilization
+                break;
         }
         
-        // Calculate maximum motion over recent frames
-        float maxMotion = 0.0f;
-        for (const auto &transform : recentTransforms) {
-            float motionMagnitude = std::sqrt(transform[0] * transform[0] + transform[1] * transform[1]);
-            maxMotion = std::max(maxMotion, motionMagnitude);
-        }
-        
-        // Scale border based on detected motion
-        float dynamicBorder = params_.borderSize;
-        
-        if (maxMotion > params_.motionThresholdLow) {
-            // Scale border proportionally to motion
-            float motionFactor = std::min(static_cast<float>(maxMotion / params_.motionThresholdHigh), 1.0f);
-            dynamicBorder = params_.borderSize * (1.0f + motionFactor * (params_.borderScaleFactor - 1.0f));
-        }
-        
-        return dynamicBorder;
+        return std::max(0.1f, std::min(1.0f, strength));
     }
-    
-    // Roll compensation for banking during turns (common in flight footage)
-    void Stabilizer::compensateForRoll(cv::Vec3f &tform)
-    {
-        // Extract rotation component
-        float rotation = tform[2];
+
+    // Utility function to calculate variance
+    float Stabilizer::calculateVariance(const std::vector<float>& values) {
+        if(values.empty()) return 0.0f;
         
-        // Check for significant roll (banking)
-        if (std::abs(rotation) > 0.05f) { // ~3 degrees threshold
-            // Apply compensation factor to allow some natural banking
-            // while still reducing excessive roll
-            tform[2] = rotation * (1.0f - params_.rollCompensationFactor);
+        float mean = 0.0f;
+        for(float v : values) mean += v;
+        mean /= values.size();
+        
+        float variance = 0.0f;
+        for(float v : values) {
+            variance += (v - mean) * (v - mean);
+        }
+        variance /= values.size();
+        
+        return variance;
+    }
+
+    // Utility function to calculate consistency
+    float Stabilizer::calculateConsistency(const std::vector<float>& values) {
+        if(values.size() < 2) return 0.0f;
+        
+        float variance = calculateVariance(values);
+        float mean = 0.0f;
+        for(float v : values) mean += v;
+        mean /= values.size();
+        
+        if(mean == 0.0f) return 0.0f;
+        
+        float consistency = 1.0f / (1.0f + (variance / (mean * mean)));
+        return std::max(0.0f, std::min(1.0f, consistency));
+    }
+
+    // Professional motion validation and filtering (iPhone/GoPro-like)
+    Transform Stabilizer::validateAndFilterMotion(const Transform& rawTransform) {
+        frameCount_++;
+        
+        // Motion magnitude analysis
+        float motionMagnitude = std::sqrt(rawTransform.dx * rawTransform.dx + 
+                                        rawTransform.dy * rawTransform.dy);
+        float angularMotion = std::abs(rawTransform.da) * 180.0f / M_PI;
+        
+        // Update motion history for pattern analysis
+        MotionSample sample;
+        sample.transform = rawTransform;
+        sample.magnitude = motionMagnitude;
+        sample.timestamp = frameCount_;
+        sample.confidence = calculateMotionConfidence(rawTransform);
+        
+        motionHistory_.push_back(sample);
+        if(motionHistory_.size() > 100) {
+            motionHistory_.erase(motionHistory_.begin());
+        }
+        
+        // Classify motion type (like iPhone Action mode)
+        MotionType motionType = classifyMotion(rawTransform, motionMagnitude);
+        
+        // Scene-aware motion filtering
+        Transform filteredTransform = rawTransform;
+        
+        // Apply different filters based on motion type
+        switch(motionType) {
+            case MotionType::INTENTIONAL_PAN:
+                filteredTransform = applyIntentionalMotionFilter(rawTransform);
+                break;
+                
+            case MotionType::CAMERA_SHAKE:
+                filteredTransform = applyShakeRemovalFilter(rawTransform);
+                break;
+                
+            case MotionType::WALKING_VIBRATION:
+                filteredTransform = applyWalkingStabilization(rawTransform);
+                break;
+                
+            case MotionType::VEHICLE_VIBRATION:
+                filteredTransform = applyVehicleStabilization(rawTransform);
+                break;
+                
+            default:
+                filteredTransform = applyGeneralStabilization(rawTransform);
+                break;
+        }
+        
+        // Horizon lock if enabled
+        if(horizonLockEnabled_) {
+            filteredTransform = applyHorizonLock(filteredTransform);
+        }
+        
+        // Update velocity and acceleration filters
+        updatePredictiveFilters(filteredTransform);
+        
+        lastValidTransform_ = filteredTransform;
+        return filteredTransform;
+    }
+
+    // Motion confidence calculation
+    float Stabilizer::calculateMotionConfidence(const Transform& transform) {
+        float magnitude = std::sqrt(transform.dx * transform.dx + transform.dy * transform.dy);
+        float confidence = std::exp(-magnitude / 10.0f);  // Exponential decay
+        return std::max(0.1f, std::min(1.0f, confidence));
+    }
+
+    // Professional motion classification (iPhone/GoPro-like)
+    MotionType Stabilizer::classifyMotion(const Transform& transform, float magnitude) {
+        float angularVelocity = std::abs(transform.da) * 180.0f / M_PI * 30.0f;  // Convert to deg/sec
+        
+        // Analyze motion history for patterns
+        if(motionHistory_.size() >= 10) {
+            bool consistentDirection = true;
+            float avgDx = 0, avgDy = 0;
             
-            if (params_.logging) {
-                logMessage("Compensating for roll/banking: " + std::to_string(rotation) + 
-                           " reduced to " + std::to_string(tform[2]));
+            for(size_t i = motionHistory_.size() - 10; i < motionHistory_.size(); i++) {
+                avgDx += motionHistory_[i].transform.dx;
+                avgDy += motionHistory_[i].transform.dy;
+            }
+            avgDx /= 10.0f;
+            avgDy /= 10.0f;
+            
+            // Check for intentional panning motion
+            float panSpeed = std::sqrt(avgDx * avgDx + avgDy * avgDy);
+            if(panSpeed > 5.0f && angularVelocity < 10.0f) {
+                return MotionType::INTENTIONAL_PAN;
+            }
+        }
+        
+        // Classify based on magnitude and angular velocity
+        if(angularVelocity > 30.0f && magnitude < 5.0f) {
+            return MotionType::CAMERA_SHAKE;
+        }
+        
+        if(magnitude > 3.0f && magnitude < 8.0f && angularVelocity < 15.0f) {
+            return MotionType::WALKING_VIBRATION;
+        }
+        
+        if(magnitude > 10.0f) {
+            return MotionType::VEHICLE_VIBRATION;
+        }
+        
+        return MotionType::NORMAL;
+    }
+
+    // Intentional motion filter (preserve panning)
+    Transform Stabilizer::applyIntentionalMotionFilter(const Transform& transform) {
+        float smoothingFactor = 0.2f;  // Minimal smoothing
+        
+        Transform smoothed;
+        smoothed.dx = transform.dx * (1.0f - smoothingFactor) + lastValidTransform_.dx * smoothingFactor;
+        smoothed.dy = transform.dy * (1.0f - smoothingFactor) + lastValidTransform_.dy * smoothingFactor;
+        smoothed.da = transform.da * (1.0f - smoothingFactor) + lastValidTransform_.da * smoothingFactor;
+        
+        return smoothed;
+    }
+
+    // Camera shake removal filter
+    Transform Stabilizer::applyShakeRemovalFilter(const Transform& transform) {
+        float smoothingFactor = 0.8f;  // Strong smoothing
+        
+        Transform smoothed;
+        smoothed.dx = transform.dx * (1.0f - smoothingFactor) + lastValidTransform_.dx * smoothingFactor;
+        smoothed.dy = transform.dy * (1.0f - smoothingFactor) + lastValidTransform_.dy * smoothingFactor;
+        smoothed.da = transform.da * (1.0f - smoothingFactor) + lastValidTransform_.da * smoothingFactor;
+        
+        return smoothed;
+    }
+
+    // Walking stabilization filter
+    Transform Stabilizer::applyWalkingStabilization(const Transform& transform) {
+        float smoothingFactor = 0.5f;
+        
+        Transform smoothed;
+        smoothed.dx = transform.dx * (1.0f - smoothingFactor) + lastValidTransform_.dx * smoothingFactor;
+        smoothed.dy = transform.dy * (1.0f - smoothingFactor) + lastValidTransform_.dy * smoothingFactor;
+        smoothed.da = transform.da * (1.0f - smoothingFactor) + lastValidTransform_.da * smoothingFactor;
+        
+        return smoothed;
+    }
+
+    // Vehicle stabilization filter
+    Transform Stabilizer::applyVehicleStabilization(const Transform& transform) {
+        float smoothingFactor = 0.7f;
+        
+        Transform smoothed;
+        smoothed.dx = transform.dx * (1.0f - smoothingFactor) + lastValidTransform_.dx * smoothingFactor;
+        smoothed.dy = transform.dy * (1.0f - smoothingFactor) + lastValidTransform_.dy * smoothingFactor;
+        smoothed.da = transform.da * (1.0f - smoothingFactor) + lastValidTransform_.da * smoothingFactor;
+        
+        return smoothed;
+    }
+
+    // General stabilization filter
+    Transform Stabilizer::applyGeneralStabilization(const Transform& transform) {
+        float smoothingFactor = 0.6f;
+        
+        Transform smoothed;
+        smoothed.dx = transform.dx * (1.0f - smoothingFactor) + lastValidTransform_.dx * smoothingFactor;
+        smoothed.dy = transform.dy * (1.0f - smoothingFactor) + lastValidTransform_.dy * smoothingFactor;
+        smoothed.da = transform.da * (1.0f - smoothingFactor) + lastValidTransform_.da * smoothingFactor;
+        
+        return smoothed;
+    }
+
+    // Horizon lock implementation
+    Transform Stabilizer::applyHorizonLock(const Transform& transform) {
+        // Estimate horizon angle from motion history
+        if(motionHistory_.size() >= 30) {
+            float totalRotation = 0;
+            for(size_t i = motionHistory_.size() - 30; i < motionHistory_.size(); i++) {
+                totalRotation += motionHistory_[i].transform.da;
+            }
+            
+            // Update horizon estimate
+            horizonAngle_ += totalRotation / 30.0f;
+            horizonConfidence_ = std::min(1.0f, horizonConfidence_ + 0.01f);
+            
+            // Apply horizon correction
+            Transform corrected = transform;
+            if(horizonConfidence_ > 0.5f) {
+                corrected.da = transform.da - horizonAngle_ * 0.1f;  // Gentle correction
+            }
+            
+            return corrected;
+        }
+        
+        return transform;
+    }
+
+    // Update predictive filters
+    void Stabilizer::updatePredictiveFilters(const Transform& transform) {
+        // Update velocity filter
+        velocityFilter_.push_back(transform.dx);
+        if(velocityFilter_.size() > 5) {
+            velocityFilter_.erase(velocityFilter_.begin());
+        }
+        
+        // Calculate acceleration
+        if(velocityFilter_.size() >= 2) {
+            float acceleration = velocityFilter_.back() - velocityFilter_[velocityFilter_.size()-2];
+            accelerationFilter_.push_back(acceleration);
+            if(accelerationFilter_.size() > 3) {
+                accelerationFilter_.erase(accelerationFilter_.begin());
             }
         }
     }
-    
+
+    // Jetson Orin Nano specific optimizations
+    void Stabilizer::optimizeForJetson() {
+        // Apply Jetson-specific memory and processing optimizations
+        if(params_.logging) logMessage("Applying Jetson Orin Nano optimizations", false);
+        
+        // Set optimal thread counts for Jetson
+        cv::setNumThreads(4);  // Jetson Orin Nano has 6 cores, use 4 for OpenCV
+        
+        // Enable Jetson hardware acceleration hints
+        cv::setUseOptimized(true);
+        
+        // Additional Jetson-specific optimizations
+        #ifdef __ARM_NEON
+        // ARM NEON optimizations are automatically enabled by OpenCV
+        if(params_.logging) logMessage("ARM NEON optimizations enabled", false);
+        #endif
+        
+        if(params_.logging) logMessage("Jetson optimizations applied", false);
+    }
+
     // Butterworth filter implementation for frequency-specific smoothing
-    std::vector<float> Stabilizer::butterworthFilter(const std::vector<float> &path, double cutoffFreq, int order)
-    {
+    std::vector<float> Stabilizer::butterworthFilter(const std::vector<float> &path, double cutoffFreq, int order) {
         if (path.empty() || order < 1) {
             return path;
         }
@@ -1446,8 +1971,7 @@ else {
         std::vector<float> result(path.size());
         
         // Simple first-order butterworth implementation
-        // A more complete implementation would use proper digital filter design
-        float alpha = cutoffFreq / (cutoffFreq + 1.0f);
+        float alpha = static_cast<float>(cutoffFreq / (cutoffFreq + 1.0));
         
         // Forward pass (causal)
         result[0] = path[0];
@@ -1458,19 +1982,18 @@ else {
         // For higher order filters, repeat the process
         for (int o = 1; o < order; o++) {
             std::vector<float> temp = result;
-            
-            // Forward pass
-            for (size_t i = 1; i < temp.size(); i++) {
-                result[i] = alpha * temp[i] + (1.0f - alpha) * result[i-1];
+            temp[0] = result[0];
+            for (size_t i = 1; i < result.size(); i++) {
+                temp[i] = alpha * result[i] + (1.0f - alpha) * temp[i-1];
             }
+            result = temp;
         }
         
         return result;
     }
     
     // Adaptive frequency filter that removes different frequencies based on content
-    std::vector<float> Stabilizer::adaptiveFrequencyFilter(const std::vector<float> &path)
-    {
+    std::vector<float> Stabilizer::adaptiveFrequencyFilter(const std::vector<float> &path) {
         if (path.empty()) {
             return path;
         }
@@ -1486,205 +2009,386 @@ else {
         
         return finalFiltered;
     }
+
+    // Virtual Canvas Stabilization Implementation
     
-    // Separate motion into translation and rotation components for independent processing
-    void Stabilizer::separateMotionComponents(const cv::Vec3f &motion, cv::Vec2f &translation, float &rotation)
-    {
-        // Extract translation components
-        translation[0] = motion[0]; // x translation
-        translation[1] = motion[1]; // y translation
-        
-        // Extract rotation component
-        rotation = motion[2]; // rotation angle
-        
-        if (params_.logging) {
-            logMessage("Motion separated: translation(" + 
-                       std::to_string(translation[0]) + ", " + 
-                       std::to_string(translation[1]) + "), rotation=" + 
-                       std::to_string(rotation));
-        }
-    }
-    
-    // Calculate reliability score for features based on tracking consistency
-    float Stabilizer::getFeatureReliabilityScore(const std::vector<cv::Point2f> &prevPts, const std::vector<cv::Point2f> &currPts)
-    {
-        if (prevPts.empty() || currPts.empty() || prevPts.size() != currPts.size()) {
-            return 0.0f;
+    cv::Mat Stabilizer::applyVirtualCanvasStabilization(const cv::Mat& currentFrame, const cv::Vec3f& transform) {
+        if (currentFrame.empty()) {
+            return currentFrame;
         }
         
-        // Calculate motion vectors
-        std::vector<cv::Point2f> motions(prevPts.size());
-        for (size_t i = 0; i < prevPts.size(); i++) {
-            motions[i] = currPts[i] - prevPts[i];
-        }
-        
-        // Calculate mean motion
-        cv::Point2f meanMotion(0, 0);
-        for (const auto& m : motions) {
-            meanMotion += m;
-        }
-        meanMotion.x /= motions.size();
-        meanMotion.y /= motions.size();
-        
-        // Calculate variance (as a measure of consistency)
-        float variance = 0.0f;
-        for (const auto& m : motions) {
-            float dx = m.x - meanMotion.x;
-            float dy = m.y - meanMotion.y;
-            variance += dx*dx + dy*dy;
-        }
-        variance /= motions.size();
-        
-        // Convert variance to reliability score (inverse relationship)
-        // Lower variance means higher reliability
-        float reliability = 1.0f / (1.0f + variance);
-        
-        return reliability;
-    }
-    
-    // Classify scene type to adapt parameters
-    void Stabilizer::classifySceneType(const cv::Mat &frame)
-    {
-        // Simple classification based on recent motion patterns and image characteristics
-        
-        // Skip if not enough history
-        if (transforms_.size() < 5) {
-            return;
-        }
-        
-        // Calculate average motion magnitude over recent frames
-        float avgMotion = 0.0f;
-        float avgRotation = 0.0f;
-        int recentFrames = std::min(5, static_cast<int>(transforms_.size()));
-        
-        for (int i = 0; i < recentFrames; i++) {
-            int idx = transforms_.size() - 1 - i;
-            cv::Vec3f transform = transforms_[idx];
-            float magnitude = std::sqrt(transform[0] * transform[0] + transform[1] * transform[1]);
-            avgMotion += magnitude;
-            avgRotation += std::abs(transform[2]);
-        }
-        
-        avgMotion /= recentFrames;
-        avgRotation /= recentFrames;
-        
-        // Analyze image content (simple edge detection as proxy for scene complexity)
-        cv::Mat gray, edges;
-        if (frame.channels() == 3) {
-            cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
-        } else {
-            gray = frame.clone();
-        }
-        
-        cv::Canny(gray, edges, 100, 200);
-        double edgeRatio = cv::countNonZero(edges) / static_cast<double>(edges.total());
-        
-        // Scene classification based on motion and content
-        if (avgMotion < 2.0f && edgeRatio < 0.05) {
-            // Static scene with few features
-            if (params_.logging) {
-                logMessage("Scene classified as: Static, low-detail");
+        // Initialize virtual canvas on first frame or size change
+        if (virtualCanvas_.empty() || 
+            virtualCanvas_.cols != static_cast<int>(currentFrame.cols * currentCanvasScale_) ||
+            virtualCanvas_.rows != static_cast<int>(currentFrame.rows * currentCanvasScale_)) {
+            
+            // Calculate optimal canvas size based on recent motion
+            if (params_.adaptiveCanvasSize && !transforms_.empty()) {
+                currentCanvasScale_ = calculateOptimalCanvasSize(transform);
+            } else {
+                currentCanvasScale_ = params_.canvasScaleFactor;
             }
-        } 
-        else if (avgMotion < 2.0f && edgeRatio >= 0.05) {
-            // Static scene with many features
-            if (params_.logging) {
-                logMessage("Scene classified as: Static, high-detail");
-            }
-        }
-        else if (avgMotion >= 2.0f && avgMotion < 10.0f && avgRotation < 0.02) {
-            // Slow panning scene
-            if (params_.logging) {
-                logMessage("Scene classified as: Slow panning");
-            }
-        }
-        else if (avgMotion >= 10.0f || avgRotation >= 0.02) {
-            // Fast motion scene
-            if (params_.logging) {
-                logMessage("Scene classified as: Fast motion");
-            }
-        }
-    }
-    
-    // Adjust parameters based on detected scene type
-    void Stabilizer::adjustParametersForScene()
-    {
-        // This would be called after classifySceneType()
-        // Assume scene classification data is stored in member variables
-        
-        // For now, use a simple approach based just on recent motion
-        if (transforms_.size() < 5) {
-            return;
-        }
-        
-        // Calculate average motion magnitude over recent frames
-        float avgMotion = 0.0f;
-        float avgRotation = 0.0f;
-        int recentFrames = std::min(5, static_cast<int>(transforms_.size()));
-        
-        for (int i = 0; i < recentFrames; i++) {
-            int idx = transforms_.size() - 1 - i;
-            cv::Vec3f transform = transforms_[idx];
-            float magnitude = std::sqrt(transform[0] * transform[0] + transform[1] * transform[1]);
-            avgMotion += magnitude;
-            avgRotation += std::abs(transform[2]);
-        }
-        
-        avgMotion /= recentFrames;
-        avgRotation /= recentFrames;
-        
-        // Adjust parameters based on motion patterns
-        if (avgMotion < 2.0f) {
-            // Low motion - use stronger smoothing
-            if (params_.adaptiveSmoothing) {
-                int newRadius = params_.maxSmoothingRadius;
-                if (newRadius != params_.smoothingRadius) {
-                    params_.smoothingRadius = newRadius;
-                    boxKernel_.resize(params_.smoothingRadius, 1.0f / params_.smoothingRadius);
-                    if (params_.logging) {
-                        logMessage("Scene-based parameter adjustment: Low motion, increasing smoothing radius to " + 
-                                   std::to_string(params_.smoothingRadius));
+            
+            canvasSize_ = cv::Size(
+                static_cast<int>(currentFrame.cols * currentCanvasScale_),
+                static_cast<int>(currentFrame.rows * currentCanvasScale_)
+            );
+            
+            canvasCenter_ = cv::Point2f(canvasSize_.width / 2.0f, canvasSize_.height / 2.0f);
+            
+            // Create virtual canvas
+            virtualCanvas_ = createVirtualCanvas(currentFrame, transform);
+            
+            // Create blending mask for seamless integration
+            canvasBlendMask_ = cv::Mat::ones(canvasSize_, CV_32F);
+            
+            // Create smooth falloff at edges
+            int edgeRadius = params_.edgeBlendRadius;
+            for (int y = 0; y < canvasSize_.height; y++) {
+                for (int x = 0; x < canvasSize_.width; x++) {
+                    float distFromEdge = std::min({x, y, canvasSize_.width - x - 1, canvasSize_.height - y - 1});
+                    if (distFromEdge < edgeRadius) {
+                        float weight = distFromEdge / edgeRadius;
+                        canvasBlendMask_.at<float>(y, x) = weight * weight; // Smooth quadratic falloff
                     }
                 }
             }
         }
-        else if (avgMotion >= 10.0f || avgRotation >= 0.02) {
-            // High motion - use less smoothing for responsiveness
-            if (params_.adaptiveSmoothing) {
-                int newRadius = params_.minSmoothingRadius;
-                if (newRadius != params_.smoothingRadius) {
-                    params_.smoothingRadius = newRadius;
-                    boxKernel_.resize(params_.smoothingRadius, 1.0f / params_.smoothingRadius);
-                    if (params_.logging) {
-                        logMessage("Scene-based parameter adjustment: High motion, decreasing smoothing radius to " + 
-                                   std::to_string(params_.smoothingRadius));
+        
+        // Update virtual canvas with current frame
+        virtualCanvas_ = createVirtualCanvas(currentFrame, transform);
+        
+        // Blend temporal regions to eliminate jitter
+        cv::Mat finalResult = blendTemporalRegions(virtualCanvas_, currentFrame, transform);
+        
+        // Extract the stabilized region from the center of the canvas
+        cv::Point2f frameOffset(
+            canvasCenter_.x - currentFrame.cols / 2.0f - transform[0],
+            canvasCenter_.y - currentFrame.rows / 2.0f - transform[1]
+        );
+        
+        cv::Rect extractRegion(
+            std::max(0, static_cast<int>(frameOffset.x)),
+            std::max(0, static_cast<int>(frameOffset.y)),
+            currentFrame.cols,
+            currentFrame.rows
+        );
+        
+        // Ensure extract region is within canvas bounds
+        extractRegion.x = std::min(extractRegion.x, finalResult.cols - extractRegion.width);
+        extractRegion.y = std::min(extractRegion.y, finalResult.rows - extractRegion.height);
+        extractRegion.width = std::min(extractRegion.width, finalResult.cols - extractRegion.x);
+        extractRegion.height = std::min(extractRegion.height, finalResult.rows - extractRegion.y);
+        
+        if (extractRegion.width > 0 && extractRegion.height > 0 &&
+            extractRegion.x >= 0 && extractRegion.y >= 0 &&
+            extractRegion.x + extractRegion.width <= finalResult.cols &&
+            extractRegion.y + extractRegion.height <= finalResult.rows) {
+            
+            cv::Mat stabilizedFrame = finalResult(extractRegion).clone();
+            
+            // Resize to original size if needed
+            if (stabilizedFrame.size() != currentFrame.size()) {
+                cv::resize(stabilizedFrame, stabilizedFrame, currentFrame.size(), 0, 0, cv::INTER_LANCZOS4);
+            }
+            
+            return stabilizedFrame;
+        }
+        
+        // Fallback to original frame if extraction fails
+        return currentFrame;
+    }
+    
+    void Stabilizer::updateTemporalFrameBuffer(const cv::Mat& frame, const cv::Vec3f& transform) {
+        if (frame.empty()) return;
+        
+        // Add current frame to temporal buffer
+        temporalFrameBuffer_.push_back(frame.clone());
+        temporalTransformBuffer_.push_back(transform);
+        
+        // Maintain buffer size
+        while (temporalFrameBuffer_.size() > static_cast<size_t>(params_.temporalBufferSize)) {
+            temporalFrameBuffer_.pop_front();
+            temporalTransformBuffer_.pop_front();
+        }
+        
+        virtualCanvasFrameCount_++;
+    }
+    
+    cv::Mat Stabilizer::createVirtualCanvas(const cv::Mat& currentFrame, const cv::Vec3f& transform) {
+        if (currentFrame.empty()) {
+            return cv::Mat();
+        }
+        
+        // Create canvas filled with black initially
+        cv::Mat canvas = cv::Mat::zeros(canvasSize_, currentFrame.type());
+        
+        // Place current frame at the center of canvas
+        cv::Point2f framePos(
+            canvasCenter_.x - currentFrame.cols / 2.0f,
+            canvasCenter_.y - currentFrame.rows / 2.0f
+        );
+        
+        cv::Rect frameRect(
+            static_cast<int>(framePos.x),
+            static_cast<int>(framePos.y),
+            currentFrame.cols,
+            currentFrame.rows
+        );
+        
+        // Ensure frame rectangle is within canvas bounds
+        cv::Rect canvasRect(0, 0, canvas.cols, canvas.rows);
+        cv::Rect validRect = frameRect & canvasRect;
+        
+        if (validRect.width > 0 && validRect.height > 0) {
+            // Calculate corresponding region in source frame
+            cv::Rect srcRect(
+                validRect.x - frameRect.x,
+                validRect.y - frameRect.y,
+                validRect.width,
+                validRect.height
+            );
+            
+            // Copy current frame to canvas
+            if (srcRect.x >= 0 && srcRect.y >= 0 &&
+                srcRect.x + srcRect.width <= currentFrame.cols &&
+                srcRect.y + srcRect.height <= currentFrame.rows) {
+                currentFrame(srcRect).copyTo(canvas(validRect));
+            }
+        }
+        
+        return canvas;
+    }
+    
+    cv::Mat Stabilizer::blendTemporalRegions(const cv::Mat& canvas, const cv::Mat& currentFrame, const cv::Vec3f& transform) {
+        cv::Mat result = canvas.clone();
+        
+        if (temporalFrameBuffer_.size() < 2) {
+            return result; // Not enough temporal data
+        }
+        
+        // Calculate regions that need filling
+        std::vector<cv::Rect> emptyRegions;
+        
+        // Detect empty (black) regions in the canvas
+        cv::Mat grayCanvas;
+        cv::cvtColor(result, grayCanvas, cv::COLOR_BGR2GRAY);
+        
+        // Find contours of empty regions
+        cv::Mat binary;
+        cv::threshold(grayCanvas, binary, 1, 255, cv::THRESH_BINARY_INV);
+        
+        std::vector<std::vector<cv::Point>> contours;
+        cv::findContours(binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+        
+        // Process significant empty regions
+        for (const auto& contour : contours) {
+            cv::Rect boundingRect = cv::boundingRect(contour);
+            if (boundingRect.area() > 100) { // Only process significant regions
+                emptyRegions.push_back(boundingRect);
+            }
+        }
+        
+        // Fill empty regions with content from temporal frames
+        for (const cv::Rect& emptyRegion : emptyRegions) {
+            cv::Mat bestFill;
+            float bestWeight = 0.0f;
+            
+            // Search through temporal buffer for best matching content
+            for (size_t i = 0; i < temporalFrameBuffer_.size() - 1; i++) { // Exclude current frame
+                const cv::Mat& temporalFrame = temporalFrameBuffer_[i];
+                const cv::Vec3f& frameTransform = temporalTransformBuffer_[i];
+                
+                // Calculate motion-compensated region
+                cv::Vec3f relativeMotion = transform - frameTransform;
+                
+                if (isRegionAvailable(emptyRegion, relativeMotion, i)) {
+                    cv::Mat temporalRegion = extractTemporalRegion(temporalFrame, emptyRegion, relativeMotion);
+                    
+                    if (!temporalRegion.empty()) {
+                        // Calculate temporal weight (more recent = higher weight)
+                        float temporalWeight = static_cast<float>(i + 1) / temporalFrameBuffer_.size();
+                        temporalWeight *= params_.canvasBlendWeight;
+                        
+                        if (temporalWeight > bestWeight) {
+                            bestFill = temporalRegion;
+                            bestWeight = temporalWeight;
+                        }
                     }
                 }
+            }
+            
+            // Apply best fill if found
+            if (!bestFill.empty() && bestWeight > 0.0f) {
+                seamlessBlend(result, bestFill, emptyRegion, bestWeight);
+            }
+        }
+        
+        return result;
+    }
+    
+    float Stabilizer::calculateOptimalCanvasSize(const cv::Vec3f& recentMotion) {
+        if (transforms_.empty()) {
+            return params_.canvasScaleFactor;
+        }
+        
+        // Analyze recent motion magnitude
+        float motionMagnitude = std::sqrt(recentMotion[0] * recentMotion[0] + recentMotion[1] * recentMotion[1]);
+        
+        // Calculate motion variance over recent frames
+        float maxMotion = 0.0f;
+        int recentFrames = std::min(30, static_cast<int>(transforms_.size()));
+        
+        for (int i = transforms_.size() - recentFrames; i < static_cast<int>(transforms_.size()); i++) {
+            if (i >= 0) {
+                cv::Vec3f motion = transforms_[i];
+                float magnitude = std::sqrt(motion[0] * motion[0] + motion[1] * motion[1]);
+                maxMotion = std::max(maxMotion, magnitude);
+            }
+        }
+        
+        // Map motion to canvas scale
+        float motionFactor = std::max(1.0f, maxMotion / 50.0f); // Normalize by expected max motion
+        float optimalScale = params_.canvasScaleFactor + (motionFactor - 1.0f) * 0.5f;
+        
+        // Clamp to reasonable bounds
+        optimalScale = std::max(params_.minCanvasScale, std::min(params_.maxCanvasScale, optimalScale));
+        
+        if (params_.logging) {
+            logMessage("Adaptive canvas scale: " + std::to_string(optimalScale) + 
+                      " (motion: " + std::to_string(maxMotion) + ")", false);
+        }
+        
+        return optimalScale;
+    }
+    
+    cv::Mat Stabilizer::extractTemporalRegion(const cv::Mat& frame, const cv::Rect& region, const cv::Vec3f& frameTransform) {
+        if (frame.empty()) {
+            return cv::Mat();
+        }
+        
+        // Apply motion compensation to find corresponding region in temporal frame
+        cv::Mat compensated = applyMotionCompensation(frame, frameTransform);
+        
+        // Calculate corresponding region with motion compensation
+        cv::Rect compensatedRegion(
+            region.x + static_cast<int>(frameTransform[0]),
+            region.y + static_cast<int>(frameTransform[1]),
+            region.width,
+            region.height
+        );
+        
+        // Ensure region is within frame bounds
+        cv::Rect frameRect(0, 0, compensated.cols, compensated.rows);
+        cv::Rect validRegion = compensatedRegion & frameRect;
+        
+        if (validRegion.width > 0 && validRegion.height > 0) {
+            cv::Mat result = compensated(validRegion).clone();
+            
+            // Resize to match target region size if needed
+            if (result.size() != region.size()) {
+                cv::resize(result, result, region.size(), 0, 0, cv::INTER_LINEAR);
+            }
+            
+            return result;
+        }
+        
+        return cv::Mat();
+    }
+    
+    void Stabilizer::seamlessBlend(cv::Mat& target, const cv::Mat& source, const cv::Rect& region, float weight) {
+        if (source.empty() || target.empty()) return;
+        
+        // Ensure region is valid
+        cv::Rect targetRect(0, 0, target.cols, target.rows);
+        cv::Rect validRegion = region & targetRect;
+        
+        if (validRegion.width <= 0 || validRegion.height <= 0) return;
+        
+        // Resize source to match region if needed
+        cv::Mat resizedSource = source;
+        if (source.size() != validRegion.size()) {
+            cv::resize(source, resizedSource, validRegion.size(), 0, 0, cv::INTER_LINEAR);
+        }
+        
+        // Apply edge-aware blending
+        cv::Mat targetRegion = target(validRegion);
+        cv::Mat blendMask = cv::Mat::ones(validRegion.size(), CV_32F) * weight;
+        
+        // Create distance-based blending mask for smooth transitions
+        int edgeRadius = std::min(params_.edgeBlendRadius, std::min(validRegion.width, validRegion.height) / 4);
+        
+        for (int y = 0; y < validRegion.height; y++) {
+            for (int x = 0; x < validRegion.width; x++) {
+                float distFromEdge = std::min({x, y, validRegion.width - x - 1, validRegion.height - y - 1});
+                if (distFromEdge < edgeRadius) {
+                    float edgeWeight = distFromEdge / edgeRadius;
+                    blendMask.at<float>(y, x) *= edgeWeight;
+                }
+            }
+        }
+        
+        // Perform alpha blending
+        for (int y = 0; y < validRegion.height; y++) {
+            for (int x = 0; x < validRegion.width; x++) {
+                float alpha = blendMask.at<float>(y, x);
+                cv::Vec3b targetPixel = targetRegion.at<cv::Vec3b>(y, x);
+                cv::Vec3b sourcePixel = resizedSource.at<cv::Vec3b>(y, x);
+                
+                for (int c = 0; c < 3; c++) {
+                    targetPixel[c] = static_cast<uchar>(
+                        (1.0f - alpha) * targetPixel[c] + alpha * sourcePixel[c]
+                    );
+                }
+                
+                targetRegion.at<cv::Vec3b>(y, x) = targetPixel;
             }
         }
     }
     
-    // Apply deep learning based stabilization 
-    cv::Mat Stabilizer::applyDeepStabilization(const cv::Mat &frame)
-    {
-        // This function would integrate with a deep learning model for stabilization
-        // For now, provide a placeholder implementation
+    bool Stabilizer::isRegionAvailable(const cv::Rect& region, const cv::Vec3f& transform, int frameIndex) {
+        // Check if the transformed region would be within the frame bounds
+        cv::Rect transformedRegion(
+            region.x + static_cast<int>(transform[0]),
+            region.y + static_cast<int>(transform[1]),
+            region.width,
+            region.height
+        );
         
-        if (!params_.deepStabilization || frame.empty() || params_.modelPath.empty()) {
-            return frame.clone();
+        if (frameIndex >= static_cast<int>(temporalFrameBuffer_.size())) {
+            return false;
         }
         
-        if (params_.logging) {
-            logMessage("Deep stabilization requested but not fully implemented");
-        }
+        const cv::Mat& frame = temporalFrameBuffer_[frameIndex];
+        cv::Rect frameRect(0, 0, frame.cols, frame.rows);
         
-        // In a real implementation, this would:
-        // 1. Load the DNN model from params_.modelPath
-        // 2. Prepare the input frame
-        // 3. Run inference
-        // 4. Process the output
+        // Check if at least 50% of the region is available
+        cv::Rect intersection = transformedRegion & frameRect;
+        float coverage = static_cast<float>(intersection.area()) / static_cast<float>(region.area());
         
-        // For now, just return the original frame
-        return frame.clone();
+        return coverage > 0.5f;
     }
-}  // namespace vs
+    
+    cv::Mat Stabilizer::applyMotionCompensation(const cv::Mat& temporalFrame, const cv::Vec3f& motionVector) {
+        if (temporalFrame.empty()) {
+            return temporalFrame;
+        }
+        
+        // Create inverse transformation matrix to compensate for motion
+        float dx = -motionVector[0];
+        float dy = -motionVector[1];
+        float da = -motionVector[2];
+        
+        cv::Mat compensationMatrix = (cv::Mat_<float>(2, 3) <<
+            std::cos(da), -std::sin(da), dx,
+            std::sin(da), std::cos(da), dy
+        );
+        
+        cv::Mat compensated;
+        cv::warpAffine(temporalFrame, compensated, compensationMatrix, temporalFrame.size(),
+                      cv::INTER_LINEAR, cv::BORDER_REFLECT);
+        
+        return compensated;
+    }
+
+    } // namespace vs
