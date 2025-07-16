@@ -927,6 +927,18 @@ bool readConfig(
         stabNode["preserve_edge_quality"] >> stabParams.preserveEdgeQuality;
         stabNode["edge_blend_radius"] >> stabParams.edgeBlendRadius;
         
+        // HF: Drone high-frequency vibration suppression parameters
+        stabNode["drone_high_freq_mode"] >> stabParams.droneHighFreqMode;
+        stabNode["hf_shake_px"] >> stabParams.hfShakePx;
+        stabNode["hf_analysis_max_width"] >> stabParams.hfAnalysisMaxWidth;
+        stabNode["hf_rot_lp_alpha"] >> stabParams.hfRotLPAlpha;
+        stabNode["enable_conditional_clahe"] >> stabParams.enableConditionalCLAHE;
+        
+        // HF: Dead zone parameters for freeze shot
+        stabNode["hf_dead_zone_threshold"] >> stabParams.hfDeadZoneThreshold;
+        stabNode["hf_freeze_duration"] >> stabParams.hfFreezeDuration;
+        stabNode["hf_motion_accumulator_decay"] >> stabParams.hfMotionAccumulatorDecay;
+        
         // Professional motion classification thresholds
         float shakeThreshold = 3.0f, walkingThreshold = 8.0f, vehicleThreshold = 15.0f;
         stabNode["shake_level_threshold"] >> shakeThreshold;
