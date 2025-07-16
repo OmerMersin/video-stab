@@ -6,10 +6,10 @@ mode:
   height:  1080
   optimize_fps:  1
   use_cuda:  1
-  tracker_enabled: 0
+  tracker_enabled: 1
   enhancer_enabled:              0
   roll_correction_enabled:              0
-  stabilizer_enabled:              1
+  stabilizer_enabled:              0
 
 
 camera:
@@ -61,17 +61,17 @@ roll_correction:
 
 stabilizer:
   # Basic parameters - Real-time optimized stabilization
-  smoothing_radius: 15            # Reduced for faster response
-  border_type: "replicate"        # Border handling type
+  smoothing_radius: 15            # Increased for better stabilization (was 15)
+  border_type: "reflect_101"        # Border handling type
   fadeDuration: 30
   fadeAlpha: 0.9
-  border_size: 10                  # Reduced border size for speed
+  border_size: 30                  # Reduced border size for speed
   crop_n_zoom: true              # Disabled - Virtual Canvas handles sizing
   logging: true                   # Enable to see Virtual Canvas messages
   use_cuda: true
-  max_corners: 150                # Reduced for performance
-  quality_level: 0.02             # Slightly higher for better features
-  min_distance: 20.0              # Better feature distribution
+  max_corners: 300                # Reduced for performance
+  quality_level: 0.01             # Slightly higher for better features
+  min_distance: 10.0              # Better feature distribution
   block_size: 3
   
   smoothing_method: "gausian"       # box filter is fastest
@@ -136,7 +136,7 @@ stabilizer:
   walking_detection_threshold: 8.0  # Walking motion detection
   vehicle_detection_threshold: 15.0 # Vehicle vibration detection
 
-  enable_virtual_canvas: true      # Enable virtual canvas stabilization
+  enable_virtual_canvas: false      # Enable virtual canvas stabilization
   canvas_scale_factor: 1.4         # Canvas size multiplier (larger for more visible edges)
   temporal_buffer_size: 8          # Number of frames in temporal buffer (reduced for speed)
   canvas_blend_weight: 0.6         # Blending weight for temporal regions
@@ -145,6 +145,18 @@ stabilizer:
   min_canvas_scale: 1.2           # Minimum canvas scale factor  
   preserve_edge_quality: false    # Disable for speed
   edge_blend_radius: 15           # Edge blending radius in pixels (larger for more visible edges)
+
+  # HF: Drone high-frequency vibration suppression (disabled by default)
+  drone_high_freq_mode: false     # Enable drone prop vibration suppression mode
+  hf_shake_px: 0.8               # Micro-jitter amplitude threshold in analysis pixels (reduced for freeze shot)
+  hf_analysis_max_width: 960     # Maximum analysis resolution width in drone mode
+  hf_rot_lp_alpha: 0.1           # Low-pass alpha for rotation smoothing (reduced for more aggressive smoothing)
+  enable_conditional_clahe: true # Re-enable CLAHE when feature starvation detected
+  
+  # HF: Dead zone parameters for freeze shot
+  hf_dead_zone_threshold: 3.0    # Motion threshold below which camera freezes completely (reduced for better freeze shot)
+  hf_freeze_duration: 30         # Number of frames to maintain freeze after entering dead zone (reduced for quicker response)
+  hf_motion_accumulator_decay: 0.85  # How quickly accumulated motion decays (faster decay for better responsiveness)
 
 
 deepstream_tracker:

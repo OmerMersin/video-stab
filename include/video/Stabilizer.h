@@ -160,6 +160,18 @@ namespace vs {
             float minCanvasScale = 1.2f;             ///< Minimum canvas scale factor
             bool preserveEdgeQuality = true;         ///< Use high-quality edge preservation for canvas
             int edgeBlendRadius = 20;                ///< Radius for edge blending between current and temporal frames
+            
+            // HF: Drone high-frequency vibration suppression parameters
+            bool droneHighFreqMode = false;          ///< Enable drone prop vibration suppression mode
+            float hfShakePx = 1.5f;                 ///< Micro-jitter amplitude threshold in analysis pixels
+            int hfAnalysisMaxWidth = 960;           ///< Maximum analysis resolution width in drone mode
+            float hfRotLPAlpha = 0.2f;              ///< Low-pass alpha for rotation smoothing (0.0-1.0)
+            bool enableConditionalCLAHE = true;     ///< Re-enable CLAHE when feature starvation detected
+            
+            // HF: Dead zone parameters for freeze shot
+            float hfDeadZoneThreshold = 2.0f;       ///< Motion threshold below which camera freezes completely
+            int hfFreezeDuration = 10;              ///< Number of frames to maintain freeze after entering dead zone
+            float hfMotionAccumulatorDecay = 0.9f;  ///< How quickly accumulated motion decays
         };
 
         explicit Stabilizer(const Parameters &params);
@@ -268,6 +280,32 @@ namespace vs {
         void seamlessBlend(cv::Mat& target, const cv::Mat& source, const cv::Rect& region, float weight);
         bool isRegionAvailable(const cv::Rect& region, const cv::Vec3f& transform, int frameIndex);
         cv::Mat applyMotionCompensation(const cv::Mat& temporalFrame, const cv::Vec3f& motionVector);
+        
+        // HF: Drone high-frequency vibration suppression methods
+        cv::Size calculateDroneAnalysisSize(const cv::Mat& frame);
+        Transform applyMicroShakeSuppression(const Transform& rawTransform);
+        Transform applyRotationLowPass(const Transform& transform);
+        void updateTranslationHistory(const cv::Vec2f& translation);
+        cv::Vec2f calculateMedianTranslation();
+        bool shouldApplyConditionalCLAHE(int detectedFeatureCount);
+        cv::Mat applyConditionalCLAHE(const cv::Mat& grayFrame);
+        float mapJitterFrequencyToCutoff(Parameters::JitterFrequency freq);
+        
+        // HF: Dead zone freeze shot methods
+        Transform applyDeadZoneFreeze(const Transform& rawTransform);
+        bool shouldEnterDeadZone(const Transform& transform);
+        void updateMotionAccumulator(const Transform& transform);
+        Transform getFrozenTransform();
+
+        // Core shake-avoiding stabilizer methods
+        cv::Mat initializeFirstFrame(const cv::Mat &frame);
+        void detectInitialFeatures(const cv::Mat &gray);
+        void removeOutliers(std::vector<cv::Point2f> &prevPts, std::vector<cv::Point2f> &currPts);
+        cv::Vec3f calculateRigidTransform(const std::vector<cv::Point2f> &prevPts, 
+                                         const std::vector<cv::Point2f> &currPts);
+        cv::Vec3f suppressShake(const cv::Vec3f &transform);
+        void updateSmoothedPath();
+        cv::Mat applyTransform(const cv::Mat &frame, const cv::Vec3f &transform);
 
         // We store CPU frames in a queue, plus an index to match transforms
         std::deque<cv::Mat> frameQueue_;
@@ -376,6 +414,20 @@ namespace vs {
         cv::Mat canvasBlendMask_;                          ///< Blending mask for seamless integration
         float currentCanvasScale_ = 1.5f;                  ///< Current dynamic canvas scale
         int virtualCanvasFrameCount_ = 0;                  ///< Frame counter for canvas operations
+        
+        // HF: Drone high-frequency vibration suppression members
+        std::deque<cv::Vec2f> hfTranslationHistory_;       ///< Recent translation history for median reference
+        cv::Vec2f hfMedianTranslation_;                    ///< Current median translation reference
+        float hfRotationLowPass_ = 0.0f;                   ///< Low-pass filtered rotation value
+        int hfFeatureStarvationCounter_ = 0;               ///< Counter for feature starvation detection
+        cv::Ptr<cv::CLAHE> hfConditionalCLAHE_;           ///< Conditional CLAHE for feature enhancement
+        
+        // HF: Dead zone freeze shot state
+        bool hfInDeadZone_ = false;                        ///< Currently in dead zone (frozen)
+        int hfFreezeCounter_ = 0;                          ///< Frames remaining in freeze
+        float hfMotionAccumulator_ = 0.0f;                 ///< Accumulated motion magnitude
+        Transform hfFrozenTransform_;                      ///< Last transform when entering freeze mode
+        
     private:
         // Implementation details
         std::vector<float> boxFilterConvolve(const std::vector<float> &path);
