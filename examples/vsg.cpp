@@ -22,7 +22,7 @@
 #include <sstream>
 #include <sys/select.h>
 #include <unistd.h>
-#include <memory>  // For std::unique_ptr
+#include <memory>  // For smart pointers
 #include <queue>   // For std::queue
 #include <atomic>  // For std::atomic
 #include <mutex>   // For std::mutex
@@ -31,6 +31,7 @@
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
 #include <gst/gst.h>
+#include <gst/video/video.h>
 #include <future>  // For std::async
 
 
@@ -233,8 +234,39 @@ private:
             return false;
         }
         
+        cv::Mat frameToSend;
+
+        // Ensure frame has 3 channels in BGR order
+        if (frame.type() == CV_8UC4) {
+            cv::cvtColor(frame, frameToSend, cv::COLOR_BGRA2BGR);
+        } else if (frame.type() == CV_8UC1) {
+            cv::cvtColor(frame, frameToSend, cv::COLOR_GRAY2BGR);
+        } else if (frame.type() == CV_8UC3) {
+            frameToSend = frame;
+        } else {
+            std::cerr << "Unsupported frame type: " << frame.type() << std::endl;
+            return false;
+        }
+
+        // Resize if necessary to match negotiated output dimensions
+        if (frameToSend.cols != frameWidth || frameToSend.rows != frameHeight) {
+            if (frameWidth > 0 && frameHeight > 0) {
+                cv::Mat resized;
+                cv::resize(frameToSend, resized, cv::Size(frameWidth, frameHeight));
+                frameToSend = resized;
+            } else {
+                std::cerr << "Invalid target dimensions for processed output: "
+                          << frameWidth << "x" << frameHeight << std::endl;
+                return false;
+            }
+        }
+
+        if (!frameToSend.isContinuous()) {
+            frameToSend = frameToSend.clone();
+        }
+
         // Create GStreamer buffer
-        size_t bufferSize = frame.total() * frame.elemSize();
+        size_t bufferSize = frameToSend.total() * frameToSend.elemSize();
         GstBuffer* buffer = gst_buffer_new_allocate(nullptr, bufferSize, nullptr);
         
         if (!buffer) {
@@ -249,7 +281,7 @@ private:
             return false;
         }
         
-        memcpy(map.data, frame.data, bufferSize);
+        memcpy(map.data, frameToSend.data, bufferSize);
         gst_buffer_unmap(buffer, &map);
         
         // Set timestamp
@@ -276,6 +308,68 @@ private:
         }
         
         return true;
+    }
+
+    void flushOutputPipeline() {
+        if (!outputSource) {
+            return;
+        }
+
+        GstEvent* flushStart = gst_event_new_flush_start();
+        if (!gst_element_send_event(outputSource, flushStart)) {
+            std::cerr << "Failed to send flush-start event on output pipeline" << std::endl;
+        }
+
+        GstEvent* flushStop = gst_event_new_flush_stop(TRUE);
+        if (!gst_element_send_event(outputSource, flushStop)) {
+            std::cerr << "Failed to send flush-stop event on output pipeline" << std::endl;
+        }
+    }
+
+    void flushInterpipeSink(GstElement* sink, const std::string& sinkName) {
+        if (!sink) {
+            std::cerr << "Cannot flush interpipe sink " << sinkName << ": element unavailable" << std::endl;
+            return;
+        }
+
+        GstPad* pad = gst_element_get_static_pad(sink, "sink");
+        if (!pad) {
+            std::cerr << "Cannot flush interpipe sink " << sinkName << ": pad unavailable" << std::endl;
+            return;
+        }
+
+        if (!gst_pad_send_event(pad, gst_event_new_flush_start())) {
+            std::cerr << "Failed to send flush-start on " << sinkName << std::endl;
+        }
+
+        if (!gst_pad_send_event(pad, gst_event_new_flush_stop(TRUE))) {
+            std::cerr << "Failed to send flush-stop on " << sinkName << std::endl;
+        }
+
+        gst_object_unref(pad);
+    }
+
+    void requestKeyUnit(GstElement* sink, const std::string& sinkName) {
+        if (!sink) {
+            std::cerr << "Cannot request key unit on " << sinkName << ": element unavailable" << std::endl;
+            return;
+        }
+
+        GstPad* pad = gst_element_get_static_pad(sink, "sink");
+        if (!pad) {
+            std::cerr << "Cannot request key unit on " << sinkName << ": pad unavailable" << std::endl;
+            return;
+        }
+
+        GstEvent* keyEvent = gst_video_event_new_upstream_force_key_unit(GST_CLOCK_TIME_NONE, TRUE, 0);
+        gboolean ok = gst_pad_send_event(pad, keyEvent);
+        if (!ok) {
+            std::cerr << "Failed to request upstream key unit via " << sinkName << std::endl;
+        } else {
+            std::cout << "Requested upstream keyframe via " << sinkName << std::endl;
+        }
+
+        gst_object_unref(pad);
     }
     
 public:
@@ -316,7 +410,7 @@ public:
         // 1. SOURCE PIPELINE: RTSP source -> interpipesink (exactly like test_interpipe)
         sourcePipeline = gst_parse_launch(
             ("rtspsrc location=" + sourceAddress + " latency=0 ! "
-             "rtph264depay ! h264parse ! "
+             "rtph264depay ! h264parse config-interval=1 ! "
              "interpipesink name=source_sink sync=false async=false").c_str(), 
             nullptr);
         
@@ -329,14 +423,19 @@ public:
         sourceInterpipeSink = gst_bin_get_by_name(GST_BIN(sourcePipeline), "source_sink");
         if (sourceInterpipeSink) {
             GstCaps* h264Caps = gst_caps_from_string("video/x-h264,stream-format=byte-stream,alignment=au");
-            g_object_set(sourceInterpipeSink, "caps", h264Caps, nullptr);
+            g_object_set(sourceInterpipeSink,
+                         "caps", h264Caps,
+                         "forward-events", TRUE,
+                         "forward-eos", TRUE,
+                         nullptr);
             gst_caps_unref(h264Caps);
             std::cout << "Set explicit H264 caps on source interpipesink" << std::endl;
         }
         
         // 2. PASSTHROUGH PIPELINE: interpipesrc -> direct output (ZERO LATENCY - no queues/buffers)
         passthroughPipeline = gst_parse_launch(
-            "interpipesrc listen-to=source_sink name=passthrough_src is-live=true format=time ! "
+            "interpipesrc listen-to=source_sink name=passthrough_src is-live=true format=time allow-renegotiation=true stream-sync=restart-ts ! "
+            "h264parse config-interval=1 ! "
             "interpipesink name=passthrough_sink sync=false async=false",
             nullptr);
         
@@ -349,19 +448,27 @@ public:
         passthroughInterpipeSink = gst_bin_get_by_name(GST_BIN(passthroughPipeline), "passthrough_sink");
         if (passthroughInterpipeSink) {
             GstCaps* h264Caps = gst_caps_from_string("video/x-h264,stream-format=byte-stream,alignment=au");
-            g_object_set(passthroughInterpipeSink, "caps", h264Caps, nullptr);
+            g_object_set(passthroughInterpipeSink,
+                         "caps", h264Caps,
+                         "forward-events", TRUE,
+                         "forward-eos", TRUE,
+                         nullptr);
             gst_caps_unref(h264Caps);
             std::cout << "Set explicit H264 caps on passthrough interpipesink" << std::endl;
         }
         
         // 3. PROCESSING PIPELINE: interpipesrc -> decode -> appsink (for receiving frames to process)
-        processingPipeline = gst_parse_launch(
-            "interpipesrc listen-to=source_sink name=processing_src is-live=true format=time ! "
+        std::string processingPipelineStr =
+            std::string("interpipesrc listen-to=source_sink name=processing_src is-live=true format=time ! ") +
             "queue max-size-buffers=2 leaky=downstream ! "
-            "h264parse ! nvv4l2decoder ! nvvidconv ! video/x-raw,format=BGRx ! "
-            "videoconvert ! video/x-raw,format=BGR !"
-            "appsink name=processing_sink sync=false emit-signals=true max-buffers=2 drop=true",
-            nullptr);
+            "h264parse ! nvv4l2decoder ! "
+            "nvvidconv ! video/x-raw,format=BGRx,width=" + std::to_string(frameWidth) +
+            ",height=" + std::to_string(frameHeight) + " ! "
+            "videoconvert ! video/x-raw,format=BGR,width=" + std::to_string(frameWidth) +
+            ",height=" + std::to_string(frameHeight) + " ! "
+            "appsink name=processing_sink sync=false emit-signals=true max-buffers=2 drop=true";
+
+        processingPipeline = gst_parse_launch(processingPipelineStr.c_str(), nullptr);
 
         if (!processingPipeline) {
             std::cerr << "Failed to create processing pipeline" << std::endl;
@@ -377,7 +484,7 @@ public:
              "queue max-size-buffers=2 leaky=downstream ! "
              "videoconvert ! video/x-raw,format=I420 ! "
              "x264enc tune=zerolatency speed-preset=superfast bitrate=" + std::to_string(bitrate/1000) + " key-int-max=30 ! "
-             "h264parse ! "
+             "h264parse config-interval=1 ! "
              "interpipesink name=processed_sink sync=false async=false").c_str(),
             nullptr);
         
@@ -390,14 +497,18 @@ public:
         processedInterpipeSink = gst_bin_get_by_name(GST_BIN(processedOutputPipeline), "processed_sink");
         if (processedInterpipeSink) {
             GstCaps* h264Caps = gst_caps_from_string("video/x-h264,stream-format=byte-stream,alignment=au");
-            g_object_set(processedInterpipeSink, "caps", h264Caps, nullptr);
+            g_object_set(processedInterpipeSink,
+                         "caps", h264Caps,
+                         "forward-events", TRUE,
+                         "forward-eos", TRUE,
+                         nullptr);
             gst_caps_unref(h264Caps);
             std::cout << "Set explicit H264 caps on processed interpipesink" << std::endl;
         }
         
         // 5. SIMPLE OUTPUT PIPELINE: interpipesrc -> RTSP (starts with passthrough)
         outputPipeline = gst_parse_launch(
-            ("interpipesrc listen-to=passthrough_sink name=output_source is-live=true format=time ! "
+            ("interpipesrc listen-to=passthrough_sink name=output_source is-live=true format=time stream-sync=restart-ts do-timestamp=true ! "
              "queue max-size-buffers=1 leaky=downstream ! "
              "rtspclientsink location=" + outputAddress + " protocols=tcp latency=0").c_str(),
             nullptr);
@@ -413,6 +524,12 @@ public:
             std::cerr << "Failed to get output source element" << std::endl;
             return false;
         }
+        g_object_set(outputSource,
+                     "allow-renegotiation", TRUE,
+                     "handle-segment-change", TRUE,
+                     "format", GST_FORMAT_TIME,
+                     "is-live", TRUE,
+                     nullptr);
         
         // Get elements for runtime control
         processingAppsink = gst_bin_get_by_name(GST_BIN(processingPipeline), "processing_sink");
@@ -509,6 +626,15 @@ public:
         std::cout << "Waiting for passthrough pipeline to stabilize..." << std::endl;
         g_usleep(300000); // 300ms
         
+        // Clear any buffered frames in the output path before switching
+        flushOutputPipeline();
+
+    // Flush the passthrough interpipe sink so listeners start clean
+    flushInterpipeSink(passthroughInterpipeSink, "passthrough_sink");
+
+        // Ask upstream source for a fresh keyframe before switching back
+    requestKeyUnit(passthroughInterpipeSink, "passthrough_sink");
+
         // Switch output source to listen to passthrough_sink
         g_object_set(outputSource, "listen-to", "passthrough_sink", NULL);
         std::cout << "Switched output source to passthrough_sink" << std::endl;
@@ -572,6 +698,15 @@ public:
         
         std::cout << "Both processing pipelines confirmed PLAYING" << std::endl;
         
+    // Clear any buffered frames in the output path before switching
+    flushOutputPipeline();
+
+    // Flush processed sink to ensure downstream clients see a clean segment
+    flushInterpipeSink(processedInterpipeSink, "processed_sink");
+
+    // Request an IDR from the processed branch encoder to prime the output
+    requestKeyUnit(processedInterpipeSink, "processed_sink");
+
         // Switch output source to listen to processed_sink instead of passthrough_sink
         g_object_set(outputSource, "listen-to", "processed_sink", NULL);
         std::cout << "Switched output source to processed_sink" << std::endl;
@@ -1056,6 +1191,8 @@ int main(int argc, char** argv) {
     
     std::cout << "Target frame dimensions: " << frameWidth << "x" << frameHeight << std::endl;
 
+    std::mutex configMutex;
+
     // Determine initial mode
     bool usePassthrough = !runParams.enhancerEnabled && 
                          !runParams.rollCorrectionEnabled && 
@@ -1071,50 +1208,63 @@ int main(int argc, char** argv) {
     
     GStreamerPipelineManager pipelineManager(sourceAddress, outputAddress, bitrate);
     
-    // Create stabilizer as smart pointer so we can recreate it
-    std::unique_ptr<vs::Stabilizer> stab = std::make_unique<vs::Stabilizer>(stabParams);
+    // Create stabilizer as smart pointer so we can recreate it safely across threads
+    std::shared_ptr<vs::Stabilizer> stab = std::make_shared<vs::Stabilizer>(stabParams);
 
-    // Set up frame processor to use the smart pointer
+    // Set up frame processor to use thread-safe snapshots of the configuration
     pipelineManager.setFrameProcessor([&](const cv::Mat& frame) -> cv::Mat {
+        vs::Mode::Parameters localRunParams;
+        vs::Enhancer::Parameters localEnhancerParams;
+        vs::RollCorrection::Parameters localRollParams;
+        vs::Stabilizer::Parameters localStabParams;
+        std::shared_ptr<vs::Stabilizer> stabilizerSnapshot;
+
+        {
+            std::lock_guard<std::mutex> lock(configMutex);
+            localRunParams = runParams;
+            localEnhancerParams = enhancerParams;
+            localRollParams = rollParams;
+            localStabParams = stabParams;
+            stabilizerSnapshot = stab;
+        }
+
         cv::Mat processedFrame = frame.clone();
-        
-        // Debug counter to verify parameter usage
         static int debugCounter = 0;
-        
+
         try {
             // Apply processing steps based on configuration
-            if (runParams.enhancerEnabled) {
-                processedFrame = vs::Enhancer::enhanceImage(processedFrame, enhancerParams);
+            if (localRunParams.enhancerEnabled) {
+                processedFrame = vs::Enhancer::enhanceImage(processedFrame, localEnhancerParams);
             }
 
             // Apply Roll Correction
-            if (runParams.rollCorrectionEnabled) {
-                processedFrame = vs::RollCorrection::autoCorrectRoll(processedFrame, rollParams);
+            if (localRunParams.rollCorrectionEnabled) {
+                processedFrame = vs::RollCorrection::autoCorrectRoll(processedFrame, localRollParams);
             }
 
             // Apply Stabilization with current parameters
-            if (runParams.stabilizationEnabled && stab) {
+            if (localRunParams.stabilizationEnabled && stabilizerSnapshot) {
                 // Debug output every 300 frames to verify current parameters
                 if ((debugCounter++ % 300) == 0) {
-                    std::cout << "🎯 Current stabilizer mode: " << stabParams.smoothingMethod 
-                              << ", radius: " << stabParams.smoothingRadius 
-                              << ", horizon_lock: " << (stabParams.horizonLock ? "ON" : "OFF") << std::endl;
+                    std::cout << "🎯 Current stabilizer mode: " << localStabParams.smoothingMethod 
+                              << ", radius: " << localStabParams.smoothingRadius 
+                              << ", horizon_lock: " << (localStabParams.horizonLock ? "ON" : "OFF") << std::endl;
                 }
-                
-                cv::Mat stabilizedFrame = stab->stabilize(processedFrame);
+
+                cv::Mat stabilizedFrame = stabilizerSnapshot->stabilize(processedFrame);
                 if (!stabilizedFrame.empty()) {
                     processedFrame = stabilizedFrame;
                 }
             }
 
             // Apply tracking if enabled
-            if (runParams.trackerEnabled) {
+            if (localRunParams.trackerEnabled) {
                 // Get tracking coordinates from TCP
                 int x, y;
                 if (tcp.tryGetLatest(x, y)) {
                     // Process frame through tracker
                     auto detections = tracker->processFrame(processedFrame);
-                    
+
                     // Draw detections with the selected coordinates
                     if (x >= 0 && y >= 0) {
                         processedFrame = tracker->drawDetections(processedFrame, detections, x, y);
@@ -1127,7 +1277,7 @@ int main(int argc, char** argv) {
             std::cerr << "Frame processing error: " << e.what() << std::endl;
             return frame.clone();
         }
-        
+
         return processedFrame;
     });
     
@@ -1166,60 +1316,68 @@ if (loopCounter % 30 == 0) {  // Check every 30 loops
     if (stat(configFile.c_str(), &configStat) == 0) {
         if (configStat.st_mtime != lastConfigModTime) {
             std::cout << "\n=== Configuration file updated, reloading parameters... ===" << std::endl;
-            
-            // Store old values
-            bool oldPassthrough = usePassthrough;
-            bool oldStabilizerEnabled = runParams.stabilizationEnabled;
-            
-            if (readConfig(configFile, videoSource, runParams, enhancerParams, rollParams, stabParams, camParams, trackerParams)) {
-                // Update processing mode
-                usePassthrough = !runParams.enhancerEnabled && 
-                               !runParams.rollCorrectionEnabled && 
-                               !runParams.stabilizationEnabled &&
-                               !runParams.trackerEnabled;
-                
-                // IMPORTANT: Recreate stabilizer with new parameters
-                if (runParams.stabilizationEnabled) {
-                    std::cout << "Recreating stabilizer with new parameters..." << std::endl;
-                    std::cout << "  - Smoothing radius: " << stabParams.smoothingRadius << std::endl;
-                    std::cout << "  - Smoothing method: " << stabParams.smoothingMethod << std::endl;
-                    std::cout << "  - Gaussian sigma: " << stabParams.gaussianSigma << std::endl;
-                    std::cout << "  - Intentional motion threshold: " << stabParams.intentionalMotionThreshold << std::endl;
-                    std::cout << "  - Horizon lock: " << (stabParams.horizonLock ? "Enabled" : "Disabled") << std::endl;
-                    std::cout << "  - Adaptive smoothing: " << (stabParams.adaptiveSmoothing ? "Enabled" : "Disabled") << std::endl;
-                    
-                    // Clean up old stabilizer
-                    if (stab) {
-                        stab->clean();
-                    }
-                    
-                    // Create new stabilizer with updated parameters
-                    stab = std::make_unique<vs::Stabilizer>(stabParams);
-                    std::cout << "Stabilizer recreated successfully!" << std::endl;
-                } else if (oldStabilizerEnabled && !runParams.stabilizationEnabled) {
-                    // Stabilizer was disabled
-                    std::cout << "Stabilizer disabled, cleaning up..." << std::endl;
-                    if (stab) {
-                        stab->clean();
+
+            bool switchToPassthrough = false;
+            bool switchToProcessing = false;
+            bool logRecreatedStabilizer = false;
+            bool logDisabledStabilizer = false;
+            vs::Stabilizer::Parameters newStabParamsSnapshot;
+            bool configReloadSucceeded = false;
+
+            {
+                std::lock_guard<std::mutex> lock(configMutex);
+                bool oldPassthrough = usePassthrough;
+                bool oldStabilizerEnabled = runParams.stabilizationEnabled;
+
+                if (readConfig(configFile, videoSource, runParams, enhancerParams, rollParams, stabParams, camParams, trackerParams)) {
+                    configReloadSucceeded = true;
+
+                    bool newUsePassthrough = !runParams.enhancerEnabled &&
+                                             !runParams.rollCorrectionEnabled &&
+                                             !runParams.stabilizationEnabled &&
+                                             !runParams.trackerEnabled;
+
+                    if (runParams.stabilizationEnabled) {
+                        logRecreatedStabilizer = true;
+                        newStabParamsSnapshot = stabParams;
+                        stab = std::make_shared<vs::Stabilizer>(stabParams);
+                    } else if (oldStabilizerEnabled && stab) {
+                        logDisabledStabilizer = true;
                         stab.reset();
                     }
+
+                    switchToPassthrough = (!oldPassthrough && newUsePassthrough);
+                    switchToProcessing = (oldPassthrough && !newUsePassthrough);
+                    usePassthrough = newUsePassthrough;
                 }
-                
-                // Switch mode if needed - seamlessly!
-                if (oldPassthrough != usePassthrough) {
-                    if (usePassthrough) {
-                        pipelineManager.switchToPassthrough();
-                        std::cout << "Seamlessly switched to PASSTHROUGH mode" << std::endl;
-                    } else {
-                        pipelineManager.switchToProcessing();
-                        std::cout << "Seamlessly switched to PROCESSING mode" << std::endl;
-                    }
+            }
+
+            if (!configReloadSucceeded) {
+                std::cerr << "Failed to reload configuration" << std::endl;
+            } else {
+                if (logRecreatedStabilizer) {
+                    std::cout << "Recreating stabilizer with new parameters..." << std::endl;
+                    std::cout << "  - Smoothing radius: " << newStabParamsSnapshot.smoothingRadius << std::endl;
+                    std::cout << "  - Smoothing method: " << newStabParamsSnapshot.smoothingMethod << std::endl;
+                    std::cout << "  - Gaussian sigma: " << newStabParamsSnapshot.gaussianSigma << std::endl;
+                    std::cout << "  - Intentional motion threshold: " << newStabParamsSnapshot.intentionalMotionThreshold << std::endl;
+                    std::cout << "  - Horizon lock: " << (newStabParamsSnapshot.horizonLock ? "Enabled" : "Disabled") << std::endl;
+                    std::cout << "  - Adaptive smoothing: " << (newStabParamsSnapshot.adaptiveSmoothing ? "Enabled" : "Disabled") << std::endl;
+                    std::cout << "Stabilizer recreated successfully!" << std::endl;
+                } else if (logDisabledStabilizer) {
+                    std::cout << "Stabilizer disabled, releasing resources..." << std::endl;
                 }
-                
+
+                if (switchToPassthrough) {
+                    pipelineManager.switchToPassthrough();
+                    std::cout << "Seamlessly switched to PASSTHROUGH mode" << std::endl;
+                } else if (switchToProcessing) {
+                    pipelineManager.switchToProcessing();
+                    std::cout << "Seamlessly switched to PROCESSING mode" << std::endl;
+                }
+
                 lastConfigModTime = configStat.st_mtime;
                 std::cout << "Configuration reloaded successfully!" << std::endl;
-            } else {
-                std::cerr << "Failed to reload configuration" << std::endl;
             }
         }
     }
