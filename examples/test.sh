@@ -54,7 +54,8 @@ g++ "$FILE_NAME.cpp" \
   -I"/usr/include/GLES2" \
   -DUSE_NVBUF_TRANSFORM_API \
   $(pkg-config --cflags --libs opencv4) \
-  $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-rtsp-server-1.0 gstreamer-app-1.0 || echo "-L/usr/lib/aarch64-linux-gnu -lgstreamer-1.0 -lgstrtspserver-1.0 -lgstapp-1.0") \
+    $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-rtsp-server-1.0 gstreamer-app-1.0 || echo "-L/usr/lib/aarch64-linux-gnu -lgstreamer-1.0 -lgstrtspserver-1.0 -lgstapp-1.0") \
+    $(pkg-config --cflags --libs gstreamer-video-1.0 || echo "-lgstvideo-1.0") \
   $(pkg-config --cflags --libs glib-2.0 gobject-2.0) \
   $(pkg-config --cflags --libs libcurl || echo "-lcurl") \
   $(pkg-config --cflags --libs jsoncpp) \
@@ -64,7 +65,7 @@ g++ "$FILE_NAME.cpp" \
   -lvideo-stab -lopencv_core -lopencv_imgproc -lopencv_highgui -lopencv_video -lopencv_videoio \
   -lopencv_imgcodecs -lopencv_cudaoptflow -lopencv_cudawarping -lopencv_calib3d \
   -lopencv_cudaimgproc -lopencv_cudafilters -lopencv_cudaarithm -lopencv_photo -lopencv_features2d \
-  -lgstreamer-1.0 -lgstrtspserver-1.0 -lgstapp-1.0 -lgobject-2.0 -lglib-2.0 -pthread \
+    -lgstreamer-1.0 -lgstrtspserver-1.0 -lgstapp-1.0 -lgstvideo-1.0 -lgobject-2.0 -lglib-2.0 -pthread \
   -lX11 -lXext -lXfixes -lXrender -lXrandr -lXi -lXcomposite -lXcursor -lXdamage \
   -lnvdsgst_meta -lnvds_meta -lnvds_utils \
   -L/usr/lib/aarch64-linux-gnu/tegra \
