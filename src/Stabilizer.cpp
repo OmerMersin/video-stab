@@ -126,19 +126,19 @@ namespace vs {
             
             // Use Jetson-optimized GFTT parameters
     #ifdef HAVE_OPENCV_CUDAFEATURES2D
-            gfttDetector_ = cv::cuda::createGoodFeaturesToTrackDetector(
-                CV_8UC1, 
-                std::min(params_.maxCorners, 300),  // Limit features for real-time
-                0.02,     // Slightly lower quality for speed
-                10.0,     // Increased min distance
-                3,        // Smaller block size
-                false,    // useHarris = false (faster)
-                0.04
-            );
+    gfttDetector_ = cv::cuda::createGoodFeaturesToTrackDetector(
+        CV_8UC1, 
+        params_.maxCorners,        // maxCorners
+        params_.qualityLevel,      // qualityLevel
+        params_.minDistance,       // minDistance
+        params_.blockSize,         // blockSize
+        false,        // useHarris
+        0.04        // k (Harris detector parameter, not used here but required by API)
+    );
     #endif
         }
     #endif
-    
+
         // HF: Initialize drone high-frequency mode components
         if (params_.droneHighFreqMode) {
             hfTranslationHistory_.clear();
@@ -407,7 +407,7 @@ namespace vs {
         analysisSize = calculateDroneAnalysisSize(currFrameBGR);
     } else {
         // Ultra-fast analysis resolution for Jetson Orin Nano real-time performance
-        analysisSize = cv::Size(480, 270);  // Reduced for speed
+        analysisSize = cv::Size(960, 540);  // Reduced for speed
     }
     
     // Convert current frame to Gray with minimal CPU-GPU transfers
@@ -713,6 +713,9 @@ namespace vs {
                         
                         // Wait for download to complete
                         analysisStream_.waitForCompletion();
+                        
+                        logMessage("CUDA Detected features: " + std::to_string(cornersCPU.size()), false);
+
                         
                         prevKeypointsCPU_ = cornersCPU;
     #ifdef HAVE_OPENCV_CUDAOPTFLOW
@@ -1101,7 +1104,6 @@ blendedBorder.copyTo(frameWithBorder, borderMask);
                 borderHistory_ = stabilized.clone();
             }
         }
-
         // Crop and zoom if enabled
 if (params_.cropNZoom && params_.borderSize > 0)
 {
@@ -2444,7 +2446,7 @@ else {
     
     cv::Size Stabilizer::calculateDroneAnalysisSize(const cv::Mat& frame) {
         if (!params_.droneHighFreqMode) {
-            return cv::Size(480, 270);  // Default analysis size
+            return cv::Size(960, 540);  // Default analysis size
         }
         
         // Scale up analysis resolution while preserving aspect ratio

@@ -427,6 +427,15 @@ namespace vs {
         int hfFreezeCounter_ = 0;                          ///< Frames remaining in freeze
         float hfMotionAccumulator_ = 0.0f;                 ///< Accumulated motion magnitude
         Transform hfFrozenTransform_;                      ///< Last transform when entering freeze mode
+        void drawTrackingChanges(cv::Mat& frame, const std::vector<cv::Point2f>& prevPts, const std::vector<cv::Point2f>& currPts)
+{
+    if (prevPts.size() != currPts.size()) return;
+    for (size_t i = 0; i < prevPts.size(); ++i)
+    {
+        cv::line(frame, prevPts[i], currPts[i], cv::Scalar(0, 255, 0), 2); // green line
+        cv::circle(frame, currPts[i], 3, cv::Scalar(0, 0, 255), -1); // red dot
+    }
+}
         
     private:
         // Implementation details
