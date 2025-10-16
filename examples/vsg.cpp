@@ -355,21 +355,29 @@ private:
             return;
         }
 
-        GstPad* pad = gst_element_get_static_pad(sink, "sink");
-        if (!pad) {
+        GstPad* sinkPad = gst_element_get_static_pad(sink, "sink");
+        if (!sinkPad) {
             std::cerr << "Cannot request key unit on " << sinkName << ": pad unavailable" << std::endl;
             return;
         }
 
+        GstPad* peerPad = gst_pad_get_peer(sinkPad);
+        if (!peerPad) {
+            std::cerr << "Cannot request key unit on " << sinkName << ": peer pad unavailable" << std::endl;
+            gst_object_unref(sinkPad);
+            return;
+        }
+
         GstEvent* keyEvent = gst_video_event_new_upstream_force_key_unit(GST_CLOCK_TIME_NONE, TRUE, 0);
-        gboolean ok = gst_pad_send_event(pad, keyEvent);
+        gboolean ok = gst_pad_send_event(peerPad, keyEvent);
         if (!ok) {
             std::cerr << "Failed to request upstream key unit via " << sinkName << std::endl;
         } else {
             std::cout << "Requested upstream keyframe via " << sinkName << std::endl;
         }
 
-        gst_object_unref(pad);
+        gst_object_unref(peerPad);
+        gst_object_unref(sinkPad);
     }
     
 public:
@@ -409,7 +417,7 @@ public:
         
         // 1. SOURCE PIPELINE: RTSP source -> interpipesink (exactly like test_interpipe)
         sourcePipeline = gst_parse_launch(
-            ("rtspsrc location=" + sourceAddress + " latency=0 ! "
+            ("rtspsrc location=" + sourceAddress + " latency=0 protocols=tcp timeout=0 tcp-timeout=0 do-rtsp-keep-alive=true ! "
              "rtph264depay ! h264parse config-interval=1 ! "
              "interpipesink name=source_sink sync=false async=false").c_str(), 
             nullptr);
@@ -506,23 +514,37 @@ public:
             std::cout << "Set explicit H264 caps on processed interpipesink" << std::endl;
         }
         
-        // 5. SIMPLE OUTPUT PIPELINE: interpipesrc -> RTSP (starts with passthrough)
-        outputPipeline = gst_parse_launch(
-            ("interpipesrc listen-to=passthrough_sink name=output_source is-live=true format=time stream-sync=restart-ts do-timestamp=true ! "
-             "queue max-size-buffers=1 leaky=downstream ! "
-             "rtspclientsink location=" + outputAddress + " protocols=tcp latency=0").c_str(),
-            nullptr);
-        
+        // 5. OUTPUT PIPELINE: interpipesrc -> h264parse -> rtph264pay -> rtspclientsink
+        std::string outputPipelineStr =
+            "interpipesrc listen-to=passthrough_sink name=output_source is-live=true format=time stream-sync=restart-ts do-timestamp=true ! "
+            "queue max-size-buffers=4 leaky=downstream ! "
+            "h264parse config-interval=1 ! "
+            "queue max-size-buffers=4 leaky=downstream name=output_sink_queue ! "
+            "rtspclientsink name=output_sink location=" + outputAddress + " protocols=tcp latency=0 retry=5";
+
+        outputPipeline = gst_parse_launch(outputPipelineStr.c_str(), nullptr);
+
         if (!outputPipeline) {
             std::cerr << "Failed to create output pipeline" << std::endl;
             return false;
         }
-        
+
+        GstElement* outputSink = gst_bin_get_by_name(GST_BIN(outputPipeline), "output_sink");
+        if (!outputSink) {
+            std::cerr << "Failed to get RTSP client sink" << std::endl;
+            return false;
+        }
+
         // Get the interpipesrc element for switching
         outputSource = gst_bin_get_by_name(GST_BIN(outputPipeline), "output_source");
         if (!outputSource) {
             std::cerr << "Failed to get output source element" << std::endl;
             return false;
+        }
+        {
+            GstCaps* outputCaps = gst_caps_from_string("video/x-h264,stream-format=byte-stream,alignment=au");
+            g_object_set(outputSource, "caps", outputCaps, nullptr);
+            gst_caps_unref(outputCaps);
         }
         g_object_set(outputSource,
                      "allow-renegotiation", TRUE,
@@ -832,6 +854,15 @@ public:
         }
         
         if (outputPipeline) {
+            GstElement* outputSink = gst_bin_get_by_name(GST_BIN(outputPipeline), "output_sink");
+            if (outputSink) {
+                GstPad* sinkPad = gst_element_get_static_pad(outputSink, "sink_0");
+                if (sinkPad) {
+                    gst_element_release_request_pad(outputSink, sinkPad);
+                    gst_object_unref(sinkPad);
+                }
+                gst_object_unref(outputSink);
+            }
             gst_element_set_state(outputPipeline, GST_STATE_NULL);
             gst_object_unref(outputPipeline);
             outputPipeline = nullptr;
