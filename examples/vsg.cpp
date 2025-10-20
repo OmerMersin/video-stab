@@ -1234,7 +1234,7 @@ int main(int argc, char** argv) {
 
     // Create and initialize pipeline manager with source and output addresses
     std::string sourceAddress = videoSource;  // Use video source from config
-    std::string outputAddress = "rtsp://192.168.144.150:8554/forwarded";  // RTSP output
+    std::string outputAddress = "rtsp://192.168.1.56:8554/forwarded";  // RTSP output
     int bitrate = std::max(2000000, std::min(8000000, static_cast<int>(frameWidth * frameHeight * fps * 0.1)));
     
     GStreamerPipelineManager pipelineManager(sourceAddress, outputAddress, bitrate);
